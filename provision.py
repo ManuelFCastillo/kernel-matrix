@@ -42,6 +42,7 @@ Verify with:  virsh list --all      (should work without sudo)
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import shutil
@@ -161,7 +162,9 @@ class CheckResult:
 @dataclass
 class RunResult:
     distro: str
+    kernel: str = ""               # the kernel we actually observed
     checks: list[CheckResult] = field(default_factory=list)
+    falco: dict | None = None      # characterisation from falco_probe.sh
     error: str | None = None       # set when the VM never came up at all
 
     @property
@@ -562,6 +565,55 @@ def run_checks(distro: Distro, ip: str, checks: list[dict]) -> list[CheckResult]
 
 
 # ---------------------------------------------------------------------------
+# Falco: install a real eBPF security agent and characterise it
+# ---------------------------------------------------------------------------
+def run_falco_probe(distro: Distro, ip: str) -> dict:
+    """
+    Push falco_probe.sh to the guest, run it as root, parse its JSON.
+
+    This is the step that turns the lab from "does this host look capable"
+    into "does a real sensor actually work here, which driver did it pick,
+    and what did it cost". A failure is a RESULT, not an exception -- an old
+    kernel that cannot load the modern eBPF probe is precisely the finding
+    the matrix exists to surface.
+    """
+    probe = Path(__file__).parent / "falco_probe.sh"
+    if not probe.exists():
+        return {"error": "falco_probe.sh not found next to provision.py"}
+
+    log("falco: uploading probe")
+    scp = subprocess.run(
+        ["scp", *SSH_OPTS, "-i", str(SSH_KEY), str(probe),
+         f"{distro.ssh_user}@{ip}:/tmp/falco_probe.sh"],
+        capture_output=True, text=True, timeout=60,
+    )
+    if scp.returncode != 0:
+        return {"error": f"scp failed: {scp.stderr.strip()[:200]}"}
+
+    log("falco: installing and characterising (this takes a few minutes)")
+    try:
+        proc = ssh_exec(
+            ip, distro.ssh_user,
+            "sudo bash /tmp/falco_probe.sh",
+            timeout=900,                     # package install over the network is slow
+        )
+    except subprocess.TimeoutExpired:
+        return {"error": "probe timed out after 15 minutes"}
+
+    # The probe prints progress to stderr and exactly one JSON object to
+    # stdout, so we can parse stdout without filtering.
+    for line in proc.stderr.splitlines():
+        log(f"  {line}")
+
+    try:
+        start = proc.stdout.index("{")
+        return json.loads(proc.stdout[start:])
+    except (ValueError, json.JSONDecodeError) as exc:
+        return {"error": f"could not parse probe output: {exc}",
+                "raw": proc.stdout[-400:]}
+
+
+# ---------------------------------------------------------------------------
 # JUnit XML output
 # ---------------------------------------------------------------------------
 def write_junit(result: RunResult, path: Path) -> None:
@@ -612,7 +664,8 @@ def write_junit(result: RunResult, path: Path) -> None:
 # ---------------------------------------------------------------------------
 # One distro, end to end
 # ---------------------------------------------------------------------------
-def test_distro(distro: Distro, checks: list[dict], keep: bool = False) -> RunResult:
+def test_distro(distro: Distro, checks: list[dict], keep: bool = False,
+                with_falco: bool = False) -> RunResult:
     """
     The full lifecycle for a single distro.
 
@@ -648,6 +701,23 @@ def test_distro(distro: Distro, checks: list[dict], keep: bool = False) -> RunRe
             return result
 
         result.checks = run_checks(distro, ip, checks)
+
+        # capture the kernel we actually saw, for the report
+        for c in result.checks:
+            if c.name == "kernel_version_matches_expectation" and c.output:
+                result.kernel = c.output.strip().splitlines()[0]
+                break
+
+        if with_falco:
+            result.falco = run_falco_probe(distro, ip)
+            f = result.falco
+            if f.get("error"):
+                log(f"falco: {f['error']}", "FAIL")
+            else:
+                log(f"falco: driver={f.get('driver')} "
+                    f"started={f.get('started')} detected={f.get('detected')} "
+                    f"rss={f.get('rss_kb')}KB", "PASS")
+
         return result
 
     except subprocess.CalledProcessError as exc:
@@ -707,6 +777,8 @@ def main() -> int:
     parser.add_argument("--all", action="store_true", help="run every distro in the matrix")
     parser.add_argument("--list", action="store_true", help="print the matrix and exit")
     parser.add_argument("--keep", action="store_true", help="do not destroy the VM afterwards")
+    parser.add_argument("--falco", action="store_true",
+                        help="install Falco on each VM and characterise it (slow, ~5 min/distro)")
     args = parser.parse_args()
 
     distros, checks = load_matrix(args.matrix)
@@ -735,10 +807,35 @@ def main() -> int:
     ensure_dirs()
     ensure_ssh_key()
 
-    results = [test_distro(d, checks, keep=args.keep) for d in selected]
+    results = [test_distro(d, checks, keep=args.keep, with_falco=args.falco)
+               for d in selected]
 
     for result in results:
         write_junit(result, RESULTS / f"{result.distro}.xml")
+
+    # A single JSON file feeds both the HTML report and the metrics exporter.
+    # JUnit is for Jenkins; this is for everything else.
+    payload = {
+        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "host_kernel": subprocess.run(["uname", "-r"], capture_output=True,
+                                      text=True).stdout.strip(),
+        "results": [
+            {
+                "distro": r.distro,
+                "kernel": r.kernel,
+                "error": r.error,
+                "checks": [
+                    {"name": c.name, "passed": c.passed, "skipped": c.skipped,
+                     "message": c.message, "duration": round(c.duration, 2)}
+                    for c in r.checks
+                ],
+                "falco": r.falco,
+            }
+            for r in results
+        ],
+    }
+    (RESULTS / "results.json").write_text(json.dumps(payload, indent=2))
+    log(f"wrote {RESULTS / 'results.json'}")
 
     # ---- summary -------------------------------------------------------
     print()

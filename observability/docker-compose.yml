@@ -1,0 +1,74 @@
+# ============================================================================
+#  observability stack for the kernel matrix
+# ============================================================================
+#
+#  WHY A PUSHGATEWAY
+#  -----------------
+#  Prometheus is a PULL system: it scrapes targets on a schedule. That works
+#  for long-running services, and not at all for batch jobs -- by the time
+#  Prometheus comes looking, the matrix run has finished and exited.
+#
+#  Pushgateway is the accepted answer for exactly this case. The batch job
+#  pushes its numbers on completion, the gateway holds them, and Prometheus
+#  scrapes the gateway instead. Metrics survive between runs, so Grafana can
+#  show trends across builds rather than a single snapshot.
+#
+#  Ports are deliberately unusual because 8080, 8081 and 3000 are all in use
+#  or spoken for on this host.
+# ============================================================================
+services:
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: km-prometheus
+    restart: unless-stopped
+    ports:
+      - "9091:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prom-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      # Keep a year. These are a handful of series pushed a few times a day,
+      # so retention costs essentially nothing and trends need history.
+      - '--storage.tsdb.retention.time=365d'
+
+  pushgateway:
+    image: prom/pushgateway:latest
+    container_name: km-pushgateway
+    restart: unless-stopped
+    ports:
+      - "9092:9091"
+    command:
+      # Persist across restarts, otherwise a container bounce wipes history
+      # that Prometheus has not scraped yet.
+      - '--persistence.file=/data/pushgateway.store'
+      - '--persistence.interval=1m'
+    volumes:
+      - pushgw-data:/data
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: km-grafana
+    restart: unless-stopped
+    ports:
+      - "3002:3000"   # 3000 and 3001 were already taken on this host
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: kernelmatrix
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      # Skip the "change your password" wall on a lab instance.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - prometheus
+
+volumes:
+  prom-data:
+  pushgw-data:
+  grafana-data:

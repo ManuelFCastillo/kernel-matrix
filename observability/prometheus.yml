@@ -1,0 +1,12 @@
+global:
+  scrape_interval: 30s
+  evaluation_interval: 30s
+
+scrape_configs:
+  - job_name: pushgateway
+    # honor_labels is ESSENTIAL here. Without it Prometheus overwrites the
+    # job/instance labels that the pusher set, and every distro's metrics
+    # collapse into one indistinguishable series.
+    honor_labels: true
+    static_configs:
+      - targets: ['pushgateway:9091']

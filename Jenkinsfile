@@ -67,9 +67,10 @@ pipeline {
         // useful, but unbounded history eats the Jenkins home directory.
         buildDiscarder(logRotator(numToKeepStr: '30'))
 
-        // NOTE: timestamps() was removed because the Timestamper plugin is not
-        // available in this update center. provision.py prints its own
-        // timestamps on every line, so little is lost.
+        // Prefix every console line with a timestamp. When you are debugging
+        // "why did this take nine minutes", this is the difference between
+        // knowing and guessing. (Requires the Timestamper plugin.)
+        timestamps()
 
         // Do not run two of these at once. They would fight over libvirt
         // domain names, disk space, and RAM.
@@ -88,6 +89,11 @@ pipeline {
             name: 'TIER',
             choices: ['fast', 'full'],
             description: 'fast = 3 distros (~3 min). full = all 6 (~8 min).'
+        )
+        booleanParam(
+            name: 'RUN_FALCO',
+            defaultValue: false,
+            description: 'Install Falco on each VM and characterise it. Adds ~5 min per distro, and is where the interesting data comes from.'
         )
         booleanParam(
             name: 'KEEP_VMS',
@@ -129,6 +135,11 @@ pipeline {
         // Pin it. Never inherit it.
         // ------------------------------------------------------------------
         LIBVIRT_DEFAULT_URI = 'qemu:///system'
+
+        // Where the metrics go. Prometheus scrapes this gateway rather than
+        // scraping us, because a batch job has already exited by the time a
+        // scraper comes looking.
+        PUSHGATEWAY = 'http://localhost:9092'
 
         // Never buffer python output. Without this, Jenkins shows you nothing
         // for eight minutes and then dumps everything at once, which makes a
@@ -244,17 +255,13 @@ EOF
                     }
                 }
 
-                // NOTE ON CONCURRENCY
-                //
-                // There is no built-in way to cap matrix parallelism in a
-                // declarative pipeline; the usual answer is the Throttle
-                // Concurrent Builds plugin, which is not installed here.
-                //
-                // That is fine on this host: three VMs at 2GB each against
-                // 62GB of RAM and 24 threads is not close to a limit. On a
-                // smaller machine, or with a cold image cache where six
-                // simultaneous downloads would saturate the link, you would
-                // want that plugin and a throttle category.
+                // Cap concurrency. 24 threads and 62GB could run all six at
+                // once, but downloading six base images simultaneously on a
+                // cold cache will saturate the network and time out. Three at
+                // a time is a sane default; raise it once images are cached.
+                options {
+                    throttle(['kvm-matrix'])
+                }
 
                 // ---------------------------------------------------------------
                 // when{}: skip full-tier distros unless the user asked for them.
@@ -284,6 +291,7 @@ EOF
                                     set -eu
                                     python3 provision.py \\
                                         --distro '${DISTRO}' \\
+                                        ${params.RUN_FALCO ? '--falco' : ''} \\
                                         ${params.KEEP_VMS ? '--keep' : ''}
                                 """
                             }
@@ -305,6 +313,42 @@ EOF
                             }
                         }
                     }
+                }
+            }
+        }
+
+        // ===================================================================
+        // STAGE 4 -- Publish
+        //
+        // Turn the raw results into things humans and dashboards consume.
+        // Separate from the matrix on purpose: this must run even when some
+        // distros failed, because a partial matrix is still worth reporting
+        // on -- arguably MORE worth reporting on.
+        // ===================================================================
+        stage('Publish') {
+            steps {
+                sh '''
+                    set -eu
+
+                    # Merge the per-distro JSON that each matrix branch wrote.
+                    # Matrix branches run in parallel and each writes its own
+                    # file, so the merge happens here rather than in any one
+                    # branch.
+                    python3 report.py || echo "no results.json to render"
+
+                    # Metrics are best-effort. A missing pushgateway must not
+                    # fail a build whose actual job was testing kernels.
+                    python3 push_metrics.py --gateway "${PUSHGATEWAY}" || true
+                '''
+            }
+            post {
+                always {
+                    // publishHTML would be nicer but needs the HTML Publisher
+                    // plugin; archiving works everywhere and the report is
+                    // deliberately self-contained so it opens fine from the
+                    // artifact link.
+                    archiveArtifacts artifacts: 'results/report.html, results/results.json',
+                                     allowEmptyArchive: true
                 }
             }
         }
