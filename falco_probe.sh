@@ -36,6 +36,22 @@ set -uo pipefail    # deliberately NOT -e: we want to record failures, not abort
 
 say() { echo "[probe] $*" >&2; }
 
+# Anything that ends up inside a JSON string must survive json.loads().
+# systemctl and journalctl output carry newlines, tabs and quotes, and dropping
+# those straight into the payload produces "Invalid control character at line N"
+# on the far side -- which silently destroyed two distros' results before this
+# existed. Strip control characters, collapse whitespace, escape backslashes
+# and quotes, then truncate.
+json_safe() {
+    printf '%s' "$1" \
+        | sed -E 's/\x1b\[[0-9;]*[a-zA-Z]//g' \
+        | sed -E 's/\[[0-9;]+m//g' \
+        | tr -d '\000-\037' \
+        | sed 's/\\/\\\\/g; s/"/\\"/g' \
+        | tr -s ' ' \
+        | cut -c1-200
+}
+
 # --- results, filled in as we go -------------------------------------------
 INSTALLED=false
 STARTED=false
@@ -58,17 +74,17 @@ emit_and_exit() {
 {
   "installed": $INSTALLED,
   "started": $STARTED,
-  "driver": "$DRIVER",
-  "falco_version": "$FALCO_VERSION",
+  "driver": "$(json_safe "$DRIVER")",
+  "falco_version": "$(json_safe "$FALCO_VERSION")",
   "install_seconds": $INSTALL_SECONDS,
   "start_seconds": $START_SECONDS,
   "rss_kb": $RSS_KB,
   "cpu_percent": $CPU_PERCENT,
   "detected": $DETECTED,
   "detect_seconds": $DETECT_SECONDS,
-  "rule_matched": "$RULE_MATCHED",
+  "rule_matched": "$(json_safe "$RULE_MATCHED")",
   "bpf_load_errors": ${BPF_ERRORS:-0},
-  "error": "$ERROR"
+  "error": "$(json_safe "$ERROR")"
 }
 JSON
     exit 0
@@ -80,8 +96,27 @@ JSON
 say "kernel: $(uname -r)"
 install_start=$(date +%s)
 
+# ---------------------------------------------------------------------------
+# Build prerequisites for the FALLBACK drivers.
+#
+# On a recent kernel Falco loads a prebuilt CO-RE eBPF probe and needs nothing
+# else. On an older one it has to fall back to the legacy eBPF probe or to a
+# kernel module, and BOTH may need compiling against the running kernel --
+# which needs dkms, make, and the matching kernel headers.
+#
+# Minimal cloud images ship none of those. Without this step the old distros
+# fail with "dkms not found", which looks like a Falco incompatibility and is
+# really a missing toolchain. That is a false negative, and a matrix that
+# produces false negatives is worse than no matrix: it tells you a platform is
+# unsupported when it is merely unprepared.
+# ---------------------------------------------------------------------------
 if command -v apt-get >/dev/null 2>&1; then
     export DEBIAN_FRONTEND=noninteractive
+    say "installing build prerequisites for fallback drivers"
+    apt-get update -qq >/dev/null 2>&1
+    apt-get install -y -qq dkms make "linux-headers-$(uname -r)" >/dev/null 2>&1 \
+        || say "WARNING: could not install headers/dkms; kmod fallback will be unavailable"
+
 
     # Preseed the debconf answers so the package never prompts. Without this
     # the install hangs forever waiting for a driver choice that nobody is
@@ -117,14 +152,44 @@ if command -v apt-get >/dev/null 2>&1; then
         ERROR=${ERROR:-"apt install falco failed"}
     fi
 
-elif command -v dnf >/dev/null 2>&1; then
+elif command -v yum >/dev/null 2>&1 && ! command -v dnf >/dev/null 2>&1; then
+    # CentOS 7 and friends. Note this branch must come BEFORE the dnf one and
+    # exclude dnf explicitly, because RHEL 8+ ships a `yum` that is a symlink
+    # to dnf -- testing for yum first would misroute modern systems here.
+    #
+    # CentOS 7 went EOL in June 2024 and its mirrors moved to vault.centos.org,
+    # so a plain `yum install` fails on mirror resolution before it ever gets
+    # to Falco. Repoint at the vault first.
+    if grep -qi "centos.*7" /etc/os-release 2>/dev/null; then
+        sed -i -e 's/^mirrorlist/#mirrorlist/' \
+               -e 's|^#\?baseurl=http://mirror.centos.org|baseurl=http://vault.centos.org|' \
+               /etc/yum.repos.d/CentOS-*.repo 2>/dev/null
+    fi
+    say "installing build prerequisites for fallback drivers"
+    yum install -y -q dkms make "kernel-devel-$(uname -r)" >/dev/null 2>&1 \
+        || say "WARNING: could not install headers/dkms"
     rpm --import https://falco.org/repo/falcosecurity-packages.asc >/dev/null 2>&1
     curl -fsSL -o /etc/yum.repos.d/falcosecurity.repo \
         https://falco.org/repo/falcosecurity-rpm.repo >/dev/null 2>&1
-    if dnf install -y -q falco >/dev/null 2>&1; then
+    if YUM_ERR=$(yum install -y -q falco 2>&1); then
         INSTALLED=true
     else
-        ERROR="dnf install falco failed"
+        ERROR=$(echo "$YUM_ERR" | grep -iE "error|cannot|failed|No package" | head -1)
+        ERROR=${ERROR:-"yum install falco failed"}
+    fi
+
+elif command -v dnf >/dev/null 2>&1; then
+    say "installing build prerequisites for fallback drivers"
+    dnf install -y -q dkms make "kernel-devel-$(uname -r)" >/dev/null 2>&1 \
+        || say "WARNING: could not install headers/dkms"
+    rpm --import https://falco.org/repo/falcosecurity-packages.asc >/dev/null 2>&1
+    curl -fsSL -o /etc/yum.repos.d/falcosecurity.repo \
+        https://falco.org/repo/falcosecurity-rpm.repo >/dev/null 2>&1
+    if DNF_ERR=$(dnf install -y -q falco 2>&1); then
+        INSTALLED=true
+    else
+        ERROR=$(echo "$DNF_ERR" | grep -iE "error|cannot|conflict|nothing provides" | head -1)
+        ERROR=${ERROR:-"dnf install falco failed"}
     fi
 
 elif command -v zypper >/dev/null 2>&1; then
@@ -189,8 +254,22 @@ START_SECONDS=$(( $(date +%s) - start_ts ))
 say "started: $STARTED as $UNIT (${START_SECONDS}s)"
 
 if [ "$STARTED" != "true" ]; then
-    ERROR=$(systemctl status "$UNIT" 2>&1 | grep -iE 'error|failed' | head -1 | tr -d '"' | cut -c1-160)
-    ERROR=${ERROR:-"$UNIT did not become active"}
+    # Nothing came up. Report WHICH engines were attempted and how each one
+    # failed, rather than a bare "none" -- on an old kernel the whole point is
+    # knowing that modern eBPF was tried and rejected, and that the fallbacks
+    # were tried too. "none" alone cannot distinguish "never attempted" from
+    # "attempted and impossible", and only one of those is a finding.
+    ATTEMPTS=""
+    for candidate in falco-modern-bpf falco-bpf falco; do
+        systemctl list-unit-files "${candidate}.service" >/dev/null 2>&1 || continue
+        why=$(journalctl -u "$candidate" --no-pager -n 60 2>/dev/null \
+              | grep -iE "error|failed|unable|cannot|not supported|no such" \
+              | grep -viE "INFO |Skipping|Deactivated|Stopped" \
+              | tail -1 | sed 's/^.*]: //')
+        ATTEMPTS="${ATTEMPTS}${candidate}: ${why:-did not start}; "
+    done
+    ERROR="${ATTEMPTS:-no falco unit became active}"
+    DRIVER="none"
     emit_and_exit
 fi
 

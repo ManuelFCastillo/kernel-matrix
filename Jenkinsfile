@@ -86,8 +86,8 @@ pipeline {
     parameters {
         choice(
             name: 'TIER',
-            choices: ['fast', 'full'],
-            description: 'fast = 3 distros (~3 min). full = all 6 (~8 min).'
+            choices: ['fast', 'full', 'legacy', 'all'],
+            description: 'fast = 3 modern distros. full = adds RHEL family + Fedora. legacy = the old kernels where the interesting failures live (3.10 to 5.10). all = everything, 11 distros.'
         )
         booleanParam(
             name: 'RUN_FALCO',
@@ -250,7 +250,9 @@ EOF
                         // so the UI still shows the skipped ones as skipped
                         // rather than hiding them.
                         values 'ubuntu-22.04', 'ubuntu-24.04', 'debian-12',
-                               'rocky-9', 'almalinux-9', 'fedora-40'
+                               'rocky-9', 'almalinux-9', 'fedora-40',
+                               'ubuntu-20.04', 'debian-11', 'rocky-8',
+                               'ubuntu-18.04', 'centos-7'
                     }
                 }
 
@@ -269,12 +271,25 @@ EOF
                 // much better than silently not existing -- you can see at a
                 // glance what did and did not run.
                 // ---------------------------------------------------------------
+                // Tier membership mirrored from matrix.yaml. Duplication is
+                // unfortunate but declarative Jenkins cannot read the YAML to
+                // build its axis, so the axis is static and this filters it.
                 when {
                     anyOf {
-                        expression { params.TIER == 'full' }
+                        expression { params.TIER == 'all' }
                         expression {
-                            // the fast tier, mirrored from matrix.yaml
+                            params.TIER == 'fast' &&
                             ['ubuntu-22.04', 'ubuntu-24.04', 'debian-12'].contains(env.DISTRO)
+                        }
+                        expression {
+                            params.TIER == 'full' &&
+                            ['ubuntu-22.04', 'ubuntu-24.04', 'debian-12',
+                             'rocky-9', 'almalinux-9', 'fedora-40'].contains(env.DISTRO)
+                        }
+                        expression {
+                            params.TIER == 'legacy' &&
+                            ['ubuntu-20.04', 'debian-11', 'rocky-8',
+                             'ubuntu-18.04', 'centos-7'].contains(env.DISTRO)
                         }
                     }
                 }

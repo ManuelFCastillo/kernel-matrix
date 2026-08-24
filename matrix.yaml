@@ -111,6 +111,68 @@ distros:
     expect_kernel: "6.8"
     tier: full
 
+  # ==========================================================================
+  #  LEGACY TIER -- the old end, where the interesting behaviour lives
+  # ==========================================================================
+  #
+  #  Everything above runs kernel 5.14 or newer, so Falco picks modern eBPF
+  #  every single time and the matrix tells you nothing you did not already
+  #  know. The whole point of a compatibility matrix is the boundary, and the
+  #  boundary is down here.
+  #
+  #  What to watch for as these get older:
+  #
+  #    5.10   the usual floor for BTF and CO-RE. Right on the line.
+  #    5.8    below this, modern eBPF is generally unavailable
+  #    4.x    expect a fallback to the legacy eBPF probe or a kernel module
+  #    3.10   expect outright failure, and note that CentOS 7 is EOL so its
+  #           repos have moved to vault -- the install itself may not survive
+  #
+  #  A failure here is a RESULT, not a broken test. "Falco cannot run on this
+  #  kernel" is exactly the kind of thing the matrix exists to tell you, and
+  #  it is the answer a customer-facing support matrix is built from.
+  # ==========================================================================
+
+  # 5.4 -- just below the BTF floor. The first place things should change.
+  - name: ubuntu-20.04
+    image_url: https://cloud-images.ubuntu.com/releases/20.04/release/ubuntu-20.04-server-cloudimg-amd64.img
+    ssh_user: ubuntu
+    expect_kernel: "5.4"
+    tier: legacy
+
+  # 5.10 -- exactly on the boundary. The most informative single data point
+  # in the whole matrix.
+  - name: debian-11
+    image_url: https://cloud.debian.org/images/cloud/bullseye/latest/debian-11-generic-amd64.qcow2
+    ssh_user: debian
+    expect_kernel: "5.10"
+    tier: legacy
+
+  # 4.18 -- RHEL 8 family. Still very much in production in enterprises.
+  - name: rocky-8
+    image_url: https://download.rockylinux.org/pub/rocky/8/images/x86_64/Rocky-8-GenericCloud-Base.latest.x86_64.qcow2
+    ssh_user: rocky
+    expect_kernel: "4.18"
+    tier: legacy
+    memory_mb: 3072          # the image is ~2GB; give it room
+
+  # 4.15 -- Ubuntu 18.04. Past standard support, still deployed everywhere.
+  - name: ubuntu-18.04
+    image_url: https://cloud-images.ubuntu.com/releases/18.04/release/ubuntu-18.04-server-cloudimg-amd64.img
+    ssh_user: ubuntu
+    expect_kernel: "4.15"
+    tier: legacy
+
+  # 3.10 -- CentOS 7. The oldest thing that still has a usable cloud image.
+  # EOL since June 2024, so its repos have moved to vault.centos.org and the
+  # Falco install is expected to fail. Included deliberately: an honest
+  # "cannot install here" is a legitimate matrix cell.
+  - name: centos-7
+    image_url: https://cloud.centos.org/centos/7/images/CentOS-7-x86_64-GenericCloud.qcow2
+    ssh_user: centos
+    expect_kernel: "3.10"
+    tier: legacy
+    boot_timeout_sec: 420    # older cloud-init is slower to settle
 
 # ============================================================================
 #  checks -- what we actually assert on each VM

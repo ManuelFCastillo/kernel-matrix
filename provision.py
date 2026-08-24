@@ -773,7 +773,8 @@ def main() -> int:
     )
     parser.add_argument("--matrix", type=Path, default=Path("matrix.yaml"))
     parser.add_argument("--distro", help="run a single distro by name")
-    parser.add_argument("--tier", choices=["fast", "full"], help="run every distro in a tier")
+    parser.add_argument("--tier", choices=["fast", "full", "legacy"],
+                        help="run every distro in a tier")
     parser.add_argument("--all", action="store_true", help="run every distro in the matrix")
     parser.add_argument("--list", action="store_true", help="print the matrix and exit")
     parser.add_argument("--keep", action="store_true", help="do not destroy the VM afterwards")

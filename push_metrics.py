@@ -88,6 +88,12 @@ def build_payload(data: dict) -> str:
         ("km_falco_start_seconds", "Seconds from start to active", lambda f: int(f.get("start_seconds") or 0)),
         ("km_falco_detect_seconds", "Seconds from trigger to alert", lambda f: int(f.get("detect_seconds") or 0)),
         ("km_falco_install_seconds", "Seconds to install the package", lambda f: int(f.get("install_seconds") or 0)),
+        # The most interesting series in the set. Falco can open its engine
+        # and still fail to load individual BPF programs -- it keeps running,
+        # reports healthy, and every binary check passes, while silently
+        # having less visibility than it should. Kernel 5.15 does exactly this.
+        ("km_falco_bpf_load_errors", "BPF programs that failed to load despite the engine opening",
+         lambda f: int(f.get("bpf_load_errors") or 0)),
     ]
 
     for name, help_text, extract in falco_metrics:
