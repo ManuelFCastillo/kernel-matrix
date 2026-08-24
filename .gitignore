@@ -1,3 +1,4 @@
+observability/.env
 observability/grafana/data/
 *.pyc
 __pycache__/

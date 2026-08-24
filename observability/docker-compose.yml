@@ -55,8 +55,12 @@ services:
     ports:
       - "3002:3000"   # 3000 and 3001 were already taken on this host
     environment:
-      GF_SECURITY_ADMIN_USER: admin
-      GF_SECURITY_ADMIN_PASSWORD: kernelmatrix
+      # Read from the environment, never hardcoded. Copy .env.example to
+      # .env and set a real value; .env is gitignored. A default is provided
+      # so a fresh clone starts, but it is deliberately obvious that it is
+      # a placeholder rather than a real credential.
+      GF_SECURITY_ADMIN_USER: ${GF_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GF_ADMIN_PASSWORD:-CHANGE_ME}
       GF_USERS_ALLOW_SIGN_UP: "false"
       # Skip the "change your password" wall on a lab instance.
       GF_AUTH_ANONYMOUS_ENABLED: "true"
