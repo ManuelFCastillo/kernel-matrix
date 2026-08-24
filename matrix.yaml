@@ -1,0 +1,172 @@
+# ============================================================================
+#  matrix.yaml  --  the compatibility matrix, as DATA not as code
+# ============================================================================
+#
+#  Why a file instead of hardcoding the list in the pipeline:
+#
+#    * Adding a distro becomes a one-line diff that a reviewer can read,
+#      instead of a change to pipeline logic.
+#    * The same list drives local runs and CI runs, so they cannot drift.
+#    * Anyone on the team can see what is covered without reading Python.
+#
+#  This is the same idea CrowdStrike uses in falcon-scripts, where the distro
+#  list lives in the workflow file as a JSON array and gets passed into a
+#  reusable workflow. Matrix as data, pipeline as mechanism.
+#
+#  ---------------------------------------------------------------------------
+#  Fields
+#  ---------------------------------------------------------------------------
+#    name        short id, used for filenames, VM names, and JUnit test names.
+#                keep it lowercase and hyphenated: it becomes a libvirt domain
+#                name and part of a file path.
+#
+#    image_url   direct link to a cloud image (qcow2). Cloud images are small,
+#                headless, and configure themselves on first boot via cloud-init.
+#                They are NOT the same as installer ISOs -- no interactive setup.
+#
+#    ssh_user    the default account baked into that distro's cloud image.
+#                this differs per distro and is a classic source of "why won't
+#                it connect" confusion.
+#
+#    expect_kernel  a substring we assert the running kernel starts with.
+#                   this is the actual point of the exercise: proving each VM
+#                   really is running a different kernel than the host.
+#
+#    memory_mb / vcpus   per-VM resources. Cloud images are happy with 1-2GB.
+#                        With 62GB of RAM you can run 10+ of these at once.
+#
+#    tier        "fast" or "full". The pipeline runs the fast tier on every
+#                build and the full tier nightly. This is the cost-control
+#                lever: real VMs are expensive, so you do not run all of them
+#                on every commit.
+# ============================================================================
+
+defaults:
+  memory_mb: 2048
+  vcpus: 2
+  ssh_user: root          # overridden per distro below
+  boot_timeout_sec: 300   # how long to wait for SSH before declaring failure
+
+distros:
+
+  # --- Ubuntu -------------------------------------------------------------
+  # Jammy ships a 5.15 kernel. Your host runs 7.0, so a passing test here
+  # proves the VM is genuinely isolated and not just reporting the host.
+  - name: ubuntu-22.04
+    image_url: https://cloud-images.ubuntu.com/releases/22.04/release/ubuntu-22.04-server-cloudimg-amd64.img
+    ssh_user: ubuntu
+    expect_kernel: "5.15"
+    tier: fast
+
+  - name: ubuntu-24.04
+    image_url: https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-amd64.img
+    ssh_user: ubuntu
+    expect_kernel: "6.8"
+    tier: fast
+
+  # --- Debian -------------------------------------------------------------
+  # Debian 12 (bookworm) is on 6.1. Different package manager conventions
+  # from Ubuntu despite the shared ancestry, which is exactly the kind of
+  # difference a compatibility matrix exists to catch.
+  #
+  # NOTE, learned the hard way: Debian publishes TWO variants and the naming
+  # is backwards from intuition.
+  #
+  #   debian-12-genericcloud-amd64.qcow2   stripped down for cloud providers.
+  #                                        Boots under libvirt but never brings
+  #                                        up networking -- no DHCP lease, ever.
+  #
+  #   debian-12-generic-amd64.qcow2        broader driver and firmware support.
+  #                                        Gets an address in about 15 seconds.
+  #
+  # "genericcloud" sounds more general than "generic". It is not. Use generic
+  # for local KVM. This cost an evening, so it is written down.
+  - name: debian-12
+    image_url: https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-generic-amd64.qcow2
+    ssh_user: debian
+    expect_kernel: "6.1"
+    tier: fast
+
+  # --- RHEL family --------------------------------------------------------
+  # Rocky and Alma are RHEL rebuilds. Testing one of each catches the case
+  # where a vendor patches something the other does not.
+  - name: rocky-9
+    image_url: https://download.rockylinux.org/pub/rocky/9/images/x86_64/Rocky-9-GenericCloud-Base.latest.x86_64.qcow2
+    ssh_user: rocky
+    expect_kernel: "5.14"
+    tier: full
+
+  - name: almalinux-9
+    image_url: https://repo.almalinux.org/almalinux/9/cloud/x86_64/images/AlmaLinux-9-GenericCloud-latest.x86_64.qcow2
+    ssh_user: almalinux
+    expect_kernel: "5.14"
+    tier: full
+
+  # --- Fedora -------------------------------------------------------------
+  # Fedora runs ahead of everyone. Useful as an early warning for changes
+  # that will land in RHEL a year or two later.
+  - name: fedora-40
+    image_url: https://download.fedoraproject.org/pub/fedora/linux/releases/40/Cloud/x86_64/images/Fedora-Cloud-Base-Generic.x86_64-40-1.14.qcow2
+    ssh_user: fedora
+    expect_kernel: "6.8"
+    tier: full
+
+
+# ============================================================================
+#  checks -- what we actually assert on each VM
+# ============================================================================
+#
+#  Each check becomes one <testcase> in the JUnit XML that Jenkins reads.
+#  Keeping them declarative here (rather than buried in Python) means the
+#  question "what do we verify?" has a readable answer.
+#
+#  A check passes when the command exits 0 AND, if expect_contains is set,
+#  its output contains that string.
+#
+#  These particular checks answer: "is this host capable of running a modern
+#  endpoint sensor?" -- which is the shape of question the Linux Sensor team
+#  asks across their whole support matrix.
+# ============================================================================
+
+checks:
+
+  - name: kernel_version_matches_expectation
+    description: The VM is running the kernel we think it is, not the host's.
+    command: uname -r
+    expect_kernel_prefix: true      # special: compares against distro.expect_kernel
+
+  - name: kernel_is_at_least_5_10
+    description: >
+      5.10 is a common floor for modern eBPF features. A sensor that relies on
+      BTF and CO-RE needs to know which hosts can support it and which need a
+      fallback path.
+    command: uname -r
+    min_kernel: "5.10"              # special: parsed and compared numerically
+
+  - name: btf_available
+    description: >
+      /sys/kernel/btf/vmlinux is how a CO-RE eBPF program discovers kernel
+      struct layouts at load time. Its presence is the single best signal that
+      modern eBPF tooling will work on this host.
+    command: test -r /sys/kernel/btf/vmlinux && echo BTF_PRESENT || echo BTF_MISSING
+    expect_contains: BTF_PRESENT
+    allow_failure: true             # informational: older distros legitimately lack it
+
+  - name: systemd_is_running
+    description: The service manager is up, so a sensor could install a unit file.
+    command: systemctl is-system-running --wait || true
+    expect_contains: running
+
+  - name: can_read_module_list
+    description: >
+      Sanity check that we can inspect loaded kernel modules. A sensor that
+      ships a kernel module needs this to work.
+    command: lsmod | head -1
+    expect_contains: Module
+
+  - name: package_manager_responds
+    description: >
+      Distro-agnostic check that the package manager is functional, since
+      installing a sensor means installing a package.
+    command: (command -v apt-get && apt-get --version) || (command -v dnf && dnf --version) || (command -v zypper && zypper --version)
+    expect_contains: ""             # empty means "just needs exit code 0"
