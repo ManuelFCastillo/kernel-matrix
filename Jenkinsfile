@@ -67,10 +67,9 @@ pipeline {
         // useful, but unbounded history eats the Jenkins home directory.
         buildDiscarder(logRotator(numToKeepStr: '30'))
 
-        // Prefix every console line with a timestamp. When you are debugging
-        // "why did this take nine minutes", this is the difference between
-        // knowing and guessing. (Requires the Timestamper plugin.)
-        timestamps()
+        // NOTE: timestamps() was removed because the Timestamper plugin is not
+        // available in this update center. provision.py prints its own
+        // timestamps on every line, so little is lost.
 
         // Do not run two of these at once. They would fight over libvirt
         // domain names, disk space, and RAM.
