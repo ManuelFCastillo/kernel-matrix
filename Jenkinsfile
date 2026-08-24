@@ -67,10 +67,9 @@ pipeline {
         // useful, but unbounded history eats the Jenkins home directory.
         buildDiscarder(logRotator(numToKeepStr: '30'))
 
-        // Prefix every console line with a timestamp. When you are debugging
-        // "why did this take nine minutes", this is the difference between
-        // knowing and guessing. (Requires the Timestamper plugin.)
-        timestamps()
+        // NOTE: timestamps() was removed -- the Timestamper plugin is not
+        // available in this update center. provision.py prints its own
+        // timestamps on every line, so little is lost.
 
         // Do not run two of these at once. They would fight over libvirt
         // domain names, disk space, and RAM.
@@ -255,13 +254,13 @@ EOF
                     }
                 }
 
-                // Cap concurrency. 24 threads and 62GB could run all six at
-                // once, but downloading six base images simultaneously on a
-                // cold cache will saturate the network and time out. Three at
-                // a time is a sane default; raise it once images are cached.
-                options {
-                    throttle(['kvm-matrix'])
-                }
+                // NOTE ON CONCURRENCY
+                //
+                // There is no built-in way to cap matrix parallelism in a
+                // declarative pipeline; the usual answer is the Throttle
+                // Concurrent Builds plugin, which is not installed here.
+                // Three VMs at 2GB against 62GB of RAM is nowhere near a
+                // limit, so this is fine as-is on this host.
 
                 // ---------------------------------------------------------------
                 // when{}: skip full-tier distros unless the user asked for them.
