@@ -68,6 +68,27 @@ services:
     depends_on:
       - prometheus
 
+  # --------------------------------------------------------------------------
+  #  report: a plain static server for the generated HTML
+  #
+  #  Jenkins serves archived artifacts under a strict Content-Security-Policy
+  #  that blocks inline CSS, so the self-contained report renders unstyled
+  #  through the Jenkins UI. Rather than weakening Jenkins' CSP -- which is
+  #  there for good reason, since build output is untrusted -- serve the file
+  #  from something whose only job is serving files.
+  #
+  #  Read-only bind mount: this container can never modify results.
+  # --------------------------------------------------------------------------
+  report:
+    image: nginx:alpine
+    container_name: km-report
+    restart: unless-stopped
+    ports:
+      - "8087:80"
+    volumes:
+      - ${KM_RESULTS:-../results}:/usr/share/nginx/html:ro
+      - ./nginx-report.conf:/etc/nginx/conf.d/default.conf:ro
+
 volumes:
   prom-data:
   pushgw-data:
