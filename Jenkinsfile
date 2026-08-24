@@ -244,13 +244,17 @@ EOF
                     }
                 }
 
-                // Cap concurrency. 24 threads and 62GB could run all six at
-                // once, but downloading six base images simultaneously on a
-                // cold cache will saturate the network and time out. Three at
-                // a time is a sane default; raise it once images are cached.
-                options {
-                    throttle(['kvm-matrix'])
-                }
+                // NOTE ON CONCURRENCY
+                //
+                // There is no built-in way to cap matrix parallelism in a
+                // declarative pipeline; the usual answer is the Throttle
+                // Concurrent Builds plugin, which is not installed here.
+                //
+                // That is fine on this host: three VMs at 2GB each against
+                // 62GB of RAM and 24 threads is not close to a limit. On a
+                // smaller machine, or with a cold image cache where six
+                // simultaneous downloads would saturate the link, you would
+                // want that plugin and a throttle category.
 
                 // ---------------------------------------------------------------
                 // when{}: skip full-tier distros unless the user asked for them.
