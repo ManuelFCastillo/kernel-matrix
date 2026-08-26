@@ -140,6 +140,11 @@ not a joke.
 | Debian VM boots, never gets an IP | `genericcloud` is the stripped-down cloud build. `generic` is the one with drivers. The naming is backwards from intuition. |
 | Jenkins repo key rejected | The `jenkins.io-2023.key` in every guide online expired in March 2026 |
 | `dubious ownership in repository` | Git refuses repos owned by another user since CVE-2022-24765 |
+| Falco crash-loops on Debian 11, every engine | The packaged container plugin (`libcontainer.so`) needs a glibc resolver symbol (`__res_search`) older distros don't expose. The plugin loads before any engine opens, so it takes down modern eBPF, legacy eBPF, and kmod identically — looking exactly like a kernel incompatibility. Disabled the plugin; then the default ruleset *also* had to go, because its rules reference `container.*` fields that no longer exist without it. Replaced with one self-contained rule. |
+| Probe reports `started: true` during a crash loop | `systemctl list-units --state=active` catches the fraction of a second between restart and crash. One lucky sample and a dead sensor reports as healthy — with `driver` guessed from the unit name. Now requires three consecutive running samples. |
+| `driver: unknown`, rss 0, no detection — but Falco works fine | `falco-kmod-inject.service` is a oneshot helper that sorts alphabetically before `falco-kmod.service` and stays `active (exited)` forever. The probe grabbed it with `head -1` and read the wrong unit's journal from then on. Filter on sub-state `running`, not state `active`. |
+| All Falco units refuse to load on Ubuntu 18.04 | Upstream unit files say `ExecReload=kill -1 $MAINPID` — a non-absolute path. systemd 239+ resolves it from `$PATH`; systemd 237 rejects the entire unit with `Exec format error`. A drop-in can't fix it because the base file still fails to parse. `sed` the unit files to `/bin/kill`. |
+| `yum install falco` fails on CentOS 7 | Falco 0.41.0+ links against `GLIBC_2.28`; EL7 ships 2.17. The repo keeps every release, and walking versions down found 0.40.0 is the last that installs — turning the row from "install failed" into "last known good sensor version for this platform". Also: `dkms` lives in EPEL on EL7, not base. |
 
 ---
 
@@ -149,7 +154,9 @@ not a joke.
 matrix.yaml          the compatibility matrix, as data not code
 provision.py         boot, wait, check, characterise, destroy
 falco_probe.sh       runs inside the guest; emits JSON
-report.py            results.json -> self-contained HTML
+report.py            results.json -> self-contained HTML; archives every run,
+                     diffs against the previous one ("vs last run" column),
+                     and checks GitHub for untested upstream Falco releases
 push_metrics.py      results.json -> Prometheus Pushgateway
 xray_import.py       JUnit -> Jira/Xray, one environment per kernel
 Jenkinsfile          preflight -> lint -> parallel matrix -> publish

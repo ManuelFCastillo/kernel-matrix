@@ -114,7 +114,7 @@ if command -v apt-get >/dev/null 2>&1; then
     export DEBIAN_FRONTEND=noninteractive
     say "installing build prerequisites for fallback drivers"
     apt-get update -qq >/dev/null 2>&1
-    apt-get install -y -qq dkms make "linux-headers-$(uname -r)" >/dev/null 2>&1 \
+    apt-get install -y -qq dkms make gcc "linux-headers-$(uname -r)" >/dev/null 2>&1 \
         || say "WARNING: could not install headers/dkms; kmod fallback will be unavailable"
 
 
@@ -166,13 +166,34 @@ elif command -v yum >/dev/null 2>&1 && ! command -v dnf >/dev/null 2>&1; then
                /etc/yum.repos.d/CentOS-*.repo 2>/dev/null
     fi
     say "installing build prerequisites for fallback drivers"
-    yum install -y -q dkms make "kernel-devel-$(uname -r)" >/dev/null 2>&1 \
+    # dkms is not in the EL7 base repos -- it lives in EPEL. Without this the
+    # prereq install half-fails and the kmod can never be built.
+    yum install -y -q epel-release >/dev/null 2>&1
+    yum install -y -q dkms make gcc "kernel-devel-$(uname -r)" >/dev/null 2>&1 \
         || say "WARNING: could not install headers/dkms"
     rpm --import https://falco.org/repo/falcosecurity-packages.asc >/dev/null 2>&1
     curl -fsSL -o /etc/yum.repos.d/falcosecurity.repo \
         https://falco.org/repo/falcosecurity-rpm.repo >/dev/null 2>&1
     if YUM_ERR=$(yum install -y -q falco 2>&1); then
         INSTALLED=true
+    elif echo "$YUM_ERR" | grep -q "GLIBC"; then
+        # Falco 0.41.0+ links against GLIBC_2.28; EL7 ships 2.17. The repo
+        # keeps every old release, and 0.40.0 is the newest that still links
+        # against old glibc -- found by walking versions down until the
+        # depsolve stopped demanding GLIBC_2.28. Pinning it turns this row
+        # from "install failed" into the actually useful finding: the last
+        # known good sensor version for this platform. falco_version in the
+        # JSON will read 0.40.0, which is the matrix telling that story.
+        say "latest falco needs GLIBC_2.28; falling back to 0.40.0 (last EL7-compatible)"
+        yum install -y -q falco-0.40.0-1 >/dev/null 2>&1
+        # 0.40's %post scriptlet throws a harmless no-job-control warning on
+        # EL7 that can fail the transaction's exit code, so trust rpm -q
+        # rather than yum's return status.
+        if rpm -q falco >/dev/null 2>&1; then
+            INSTALLED=true
+        else
+            ERROR="falco 0.40.0 fallback install failed"
+        fi
     else
         ERROR=$(echo "$YUM_ERR" | grep -iE "error|cannot|failed|No package" | head -1)
         ERROR=${ERROR:-"yum install falco failed"}
@@ -180,7 +201,7 @@ elif command -v yum >/dev/null 2>&1 && ! command -v dnf >/dev/null 2>&1; then
 
 elif command -v dnf >/dev/null 2>&1; then
     say "installing build prerequisites for fallback drivers"
-    dnf install -y -q dkms make "kernel-devel-$(uname -r)" >/dev/null 2>&1 \
+    dnf install -y -q dkms make gcc "kernel-devel-$(uname -r)" >/dev/null 2>&1 \
         || say "WARNING: could not install headers/dkms"
     rpm --import https://falco.org/repo/falcosecurity-packages.asc >/dev/null 2>&1
     curl -fsSL -o /etc/yum.repos.d/falcosecurity.repo \
@@ -212,6 +233,43 @@ FALCO_VERSION=$(falco --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' 
 FALCO_VERSION=${FALCO_VERSION:-unknown}
 say "version: $FALCO_VERSION"
 
+# Disable the container-enrichment plugin. It links against a glibc resolver
+# symbol (__res_search) that isn't present the same way on every distro in
+# this matrix -- on the older ones Falco loads it, crashes at startup, and
+# systemd restarts it forever. This lab characterises kernel/eBPF
+# compatibility, not container metadata, so the plugin buys nothing and
+# costs a permanent crash loop. Remove its drop-in before the unit starts.
+if [ -f /etc/falco/config.d/falco.container_plugin.yaml ]; then
+    rm -f /etc/falco/config.d/falco.container_plugin.yaml
+    say "disabled container plugin (glibc symbol mismatch on older distros)"
+fi
+
+# The default falco_rules.yaml doesn't just gate on the container plugin at
+# the top of the file -- individual rule conditions (via shared macros) refer
+# to container.* fields directly. With the plugin disabled, those fields don't
+# exist and rule compilation fails outright: "filter_check called with
+# nonexistent field container.id". Patching the gate alone isn't enough.
+#
+# This probe only needs ONE thing: a rule that fires when /etc/shadow is read.
+# Rather than fight the default ruleset's container dependencies, replace it
+# with a single self-contained rule that has none.
+cat > /etc/falco/probe_rules.yaml <<'RULES'
+- rule: Sensitive File Read Probe
+  desc: Detect a read of /etc/shadow (synthetic trigger for kernel-matrix characterisation)
+  condition: (evt.type in (open, openat, openat2)) and fd.name=/etc/shadow
+  output: "Sensitive file opened for reading by non-trusted program (user=%user.name command=%proc.cmdline file=%fd.name)"
+  priority: WARNING
+  tags: [filesystem, probe]
+RULES
+# sed, not python3/perl: minimal cloud images can't be trusted to have
+# either interpreter installed (Rocky's does not ship perl by default), but
+# every distro here ships GNU sed as part of the base system.
+sed -i '/^rules_files:/,/^$/c\
+rules_files:\
+  - /etc/falco/probe_rules.yaml
+' /etc/falco/falco.yaml
+say "replaced default ruleset with a minimal container-free probe rule"
+
 # ---------------------------------------------------------------------------
 # 2. START, and find out WHICH DRIVER it chose
 # ---------------------------------------------------------------------------
@@ -227,26 +285,59 @@ say "version: $FALCO_VERSION"
 # ---------------------------------------------------------------------------
 # Falco ships SEVERAL units and only one of them runs:
 #
-#   falco-modern-bpf.service   modern CO-RE eBPF
-#   falco-bpf.service          legacy eBPF probe
-#   falco.service              kernel module (or a dispatcher, version dependent)
-#   falcoctl-artifact-*        NOT falco itself; the rule updater. Must be excluded.
+#   falco-modern-bpf.service    modern CO-RE eBPF
+#   falco-bpf.service           legacy eBPF probe
+#   falco-kmod.service          kernel module (0.38+ name; falco.service is legacy)
+#   falco-kmod-inject.service   oneshot HELPER that insmods the module. Shows
+#                               "active (exited)" forever, sorts BEFORE
+#                               falco-kmod alphabetically, and reading its
+#                               journal instead of the real unit's produced a
+#                               confident driver=unknown/rss=0/detected=false
+#                               row on ubuntu-20.04. Filter by sub-state
+#                               "running", not just "active", to skip it.
+#   falcoctl-artifact-*         NOT falco itself; the rule updater. Excluded.
 #
 # Guessing from which unit FILES exist is wrong, because several exist on
-# every install. Ask systemd which one is actually ACTIVE.
+# every install. Ask systemd which one is actually ACTIVE -- and running.
 start_ts=$(date +%s)
 
+# Falco's shipped unit files say "ExecReload=kill -1 $MAINPID" -- a
+# non-absolute path. systemd 239+ resolves that from $PATH; systemd 237
+# (ubuntu 18.04) refuses to LOAD the entire unit over it ("Exec format
+# error"), which took out all three engines at once and looked exactly like
+# "this kernel is unsupported". A drop-in cannot rescue it because the base
+# file still fails to parse, so patch the unit files themselves. Normalising
+# to /bin/kill is a no-op on modern systemd and a full fix on old.
+sed -i 's|^ExecReload=kill|ExecReload=/bin/kill|' \
+    /usr/lib/systemd/system/falco*.service \
+    /lib/systemd/system/falco*.service 2>/dev/null
+systemctl daemon-reload 2>/dev/null
+
 # Nudge whichever ones are installed; only the viable one will stay up.
-for candidate in falco-modern-bpf.service falco-bpf.service falco.service; do
+for candidate in falco-modern-bpf.service falco-bpf.service falco-kmod.service falco.service; do
     systemctl list-unit-files "$candidate" >/dev/null 2>&1 && \
         systemctl enable --now "$candidate" >/dev/null 2>&1
 done
 
 UNIT=""
+STABLE=0
 for _ in $(seq 1 30); do
-    UNIT=$(systemctl list-units 'falco*' --state=active --plain --no-legend 2>/dev/null \
-           | awk '{print $1}' | grep -v falcoctl | head -1)
-    if [ -n "$UNIT" ]; then STARTED=true; break; fi
+    # Columns are UNIT LOAD ACTIVE SUB DESC; $4=="running" excludes oneshot
+    # helpers stuck in "exited" as well as crash-loopers mid-restart.
+    CANDIDATE=$(systemctl list-units 'falco*' --state=active --plain --no-legend 2>/dev/null \
+           | awk '$4 == "running" {print $1}' | grep -v falcoctl | head -1)
+    if [ -n "$CANDIDATE" ]; then
+        # A unit can show "active (running)" for a fraction of a second in the
+        # middle of a crash loop -- systemd restarts it, it dies again a moment
+        # later, and a single snapshot cannot tell the two apart. Require three
+        # consecutive 1s samples before trusting it; a genuine crash loop never
+        # survives that window, a real start does.
+        UNIT="$CANDIDATE"
+        STABLE=$((STABLE + 1))
+        if [ "$STABLE" -ge 3 ]; then STARTED=true; break; fi
+    else
+        STABLE=0
+    fi
     sleep 1
 done
 UNIT=${UNIT:-falco.service}
@@ -260,7 +351,7 @@ if [ "$STARTED" != "true" ]; then
     # were tried too. "none" alone cannot distinguish "never attempted" from
     # "attempted and impossible", and only one of those is a finding.
     ATTEMPTS=""
-    for candidate in falco-modern-bpf falco-bpf falco; do
+    for candidate in falco-modern-bpf falco-bpf falco-kmod falco; do
         systemctl list-unit-files "${candidate}.service" >/dev/null 2>&1 || continue
         why=$(journalctl -u "$candidate" --no-pager -n 60 2>/dev/null \
               | grep -iE "error|failed|unable|cannot|not supported|no such" \
@@ -289,6 +380,7 @@ else
     case "$UNIT" in
         falco-modern-bpf.service) DRIVER="modern_ebpf" ;;
         falco-bpf.service)        DRIVER="ebpf" ;;
+        falco-kmod.service)       DRIVER="kmod" ;;
         falco.service)            DRIVER="kmod" ;;
         *)                        DRIVER="unknown" ;;
     esac

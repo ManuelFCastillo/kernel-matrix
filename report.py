@@ -28,7 +28,10 @@ from __future__ import annotations
 import argparse
 import html
 import json
+import re
 import sys
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 # How each Falco driver should read at a glance. The ordering here is the
@@ -48,8 +51,147 @@ def tile(value: str, label: str, tone: str = "") -> str:
             f'<span class="l">{html.escape(label)}</span></div>')
 
 
-def render(data: dict) -> str:
+def version_tuple(v: str) -> tuple:
+    """'0.44.1' -> (0, 44, 1). Non-numeric junk sorts as oldest."""
+    nums = re.findall(r"\d+", v or "")
+    return tuple(int(n) for n in nums) if nums else (0,)
+
+
+# ---------------------------------------------------------------------------
+# Upstream check: is the version we tested still the version that exists?
+# ---------------------------------------------------------------------------
+# A compatibility matrix is a statement about ONE sensor version. The moment
+# upstream ships a newer one, every green cell here is a claim about the
+# past. The report should know that about itself, so it asks the GitHub API
+# for the latest release and caches the answer -- the cache means an offline
+# or rate-limited re-render degrades to slightly stale instead of broken.
+UPSTREAM_CACHE = Path("results/upstream_cache.json")
+
+
+def fetch_upstream() -> dict:
+    req = urllib.request.Request(
+        "https://api.github.com/repos/falcosecurity/falco/releases/latest",
+        headers={"User-Agent": "kernel-matrix-report",
+                 "Accept": "application/vnd.github+json"})
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            rel = json.loads(resp.read())
+        info = {"tag": rel.get("tag_name", ""),
+                "published": (rel.get("published_at") or "")[:10],
+                "url": rel.get("html_url", "")}
+        UPSTREAM_CACHE.parent.mkdir(parents=True, exist_ok=True)
+        UPSTREAM_CACHE.write_text(json.dumps(info))
+        return info
+    except (urllib.error.URLError, OSError, ValueError):
+        if UPSTREAM_CACHE.exists():
+            try:
+                info = json.loads(UPSTREAM_CACHE.read_text())
+                info["stale"] = True
+                return info
+            except ValueError:
+                pass
+        return {}
+
+
+# ---------------------------------------------------------------------------
+# Run history: every render archives the results it drew from, and the diff
+# against the previous archive is what turns this page from a snapshot into
+# a regression canary. "ubuntu-20.04 stopped detecting overnight" is the
+# single most valuable sentence this report can produce, and it can only
+# produce it if it remembers yesterday.
+# ---------------------------------------------------------------------------
+RUNS_DIR = Path("results/runs")
+
+
+def archive_run(data: dict) -> None:
+    stamp = re.sub(r"[^0-9T]", "-", data.get("generated_at", "unknown"))
+    path = RUNS_DIR / f"run-{stamp}.json"
+    RUNS_DIR.mkdir(parents=True, exist_ok=True)
+    if not path.exists():                     # re-rendering must be idempotent
+        path.write_text(json.dumps(data, indent=1))
+
+
+def load_previous(current_generated: str) -> dict | None:
+    if not RUNS_DIR.is_dir():
+        return None
+    stamp = re.sub(r"[^0-9T]", "-", current_generated or "unknown")
+    older = sorted(p for p in RUNS_DIR.glob("run-*.json")
+                   if p.name != f"run-{stamp}.json")
+    if not older:
+        return None
+    try:
+        return json.loads(older[-1].read_text())
+    except ValueError:
+        return None
+
+
+def diff_runs(prev: dict | None, cur: dict) -> dict[str, list[tuple[str, str]]]:
+    """Per-distro changes as (tone, text) pairs. Empty dict = nothing moved."""
+    if not prev:
+        return {}
+    prev_by = {r["distro"]: (r.get("falco") or {}) for r in prev.get("results", [])}
+    changes: dict[str, list[tuple[str, str]]] = {}
+
+    for r in cur.get("results", []):
+        distro, f = r["distro"], (r.get("falco") or {})
+        if distro not in prev_by:
+            changes[distro] = [("warn", "new in matrix")]
+            continue
+        p = prev_by[distro]
+        out = []
+        if p.get("driver") != f.get("driver"):
+            out.append(("warn", f"driver {p.get('driver') or '?'} → {f.get('driver') or '?'}"))
+        if p.get("falco_version") != f.get("falco_version"):
+            out.append(("warn", f"falco {p.get('falco_version') or '?'} → {f.get('falco_version') or '?'}"))
+        if bool(p.get("detected")) != bool(f.get("detected")):
+            out.append(("good", "now detecting") if f.get("detected")
+                       else ("bad", "STOPPED detecting"))
+        elif bool(p.get("started")) != bool(f.get("started")):
+            out.append(("good", "now running") if f.get("started")
+                       else ("bad", "STOPPED running"))
+        prss, crss = p.get("rss_kb") or 0, f.get("rss_kb") or 0
+        if prss and crss:
+            delta = (crss - prss) / prss
+            if abs(delta) >= 0.25:
+                out.append(("warn", f"rss {delta:+.0%}"))
+        if out:
+            changes[distro] = out
+    return changes
+
+
+def render(data: dict, prev: dict | None = None, upstream: dict | None = None) -> str:
     results = data.get("results", [])
+    changes = diff_runs(prev, data)
+
+    # ---- what version is this report a statement about? ------------------
+    tested = sorted({(r.get("falco") or {}).get("falco_version")
+                     for r in results
+                     if (r.get("falco") or {}).get("falco_version")
+                     not in (None, "", "unknown")},
+                    key=version_tuple, reverse=True)
+    tested_label = " / ".join(tested) if tested else "?"
+
+    upstream = upstream or {}
+    up_ver = (upstream.get("tag") or "").lstrip("v")
+    if not up_ver:
+        banner = '<span class="pill">upstream check unavailable</span>'
+    elif tested and version_tuple(up_ver) > version_tuple(tested[0]):
+        banner = (f'<span class="pill bad">upstream {html.escape(up_ver)} '
+                  f'released {html.escape(upstream.get("published", "?"))} '
+                  f'&mdash; UNTESTED</span>')
+    else:
+        stale = " (cached)" if upstream.get("stale") else ""
+        banner = (f'<span class="pill good">up to date with upstream '
+                  f'{html.escape(up_ver)}{stale}</span>')
+
+    if prev:
+        n = sum(len(v) for v in changes.values())
+        prev_when = prev.get("generated_at", "?")
+        drift = (f'<span class="pill warn">{n} change(s) vs {html.escape(prev_when)}</span>'
+                 if n else
+                 f'<span class="pill good">no drift vs {html.escape(prev_when)}</span>')
+    else:
+        drift = '<span class="pill">first recorded run</span>'
 
     # ---- summary numbers -------------------------------------------------
     total = len(results)
@@ -99,10 +241,22 @@ def render(data: dict) -> str:
         cpu = falco.get("cpu_percent")
         cpu_txt = f"{cpu}%" if cpu not in (None, 0, "0") else "&mdash;"
 
+        ver = falco.get("falco_version")
+        ver_txt = html.escape(ver) if ver and ver != "unknown" else "&mdash;"
+
+        row_changes = changes.get(r["distro"], [])
+        if row_changes:
+            change_html = "<br>".join(
+                f'<span class="pill {t}">{html.escape(txt)}</span>'
+                for t, txt in row_changes)
+        else:
+            change_html = '<span class="unit">&mdash;</span>'
+
         rows.append(f"""
         <tr>
           <td class="distro">{html.escape(r['distro'])}</td>
           <td class="mono">{html.escape(r.get('kernel') or '&mdash;')}</td>
+          <td class="mono">{ver_txt}</td>
           <td><span class="pill {tone}" title="{html.escape(driver_help)}">{driver_label}</span></td>
           <td>{status}<div class="sub">{detail}</div></td>
           <td class="num">{rss_txt}</td>
@@ -110,6 +264,7 @@ def render(data: dict) -> str:
           <td class="num">{falco.get('start_seconds', '&mdash;')}<span class="unit">s</span></td>
           <td class="num">{falco.get('detect_seconds', '&mdash;')}<span class="unit">s</span></td>
           <td class="num">{passed}/{len(checks)}{f' <span class="unit">+{skipped} skip</span>' if skipped else ''}</td>
+          <td>{change_html}</td>
         </tr>""")
 
     driver_summary = " · ".join(
@@ -186,10 +341,11 @@ def render(data: dict) -> str:
 
   <h1>Kernel compatibility matrix</h1>
   <p class="sub-head">
-    Falco characterised across {total} Linux kernels &middot;
+    <b>Falco {html.escape(tested_label)}</b> characterised across {total} Linux kernels &middot;
     host running <span class="mono">{html.escape(data.get('host_kernel','?'))}</span> &middot;
     generated {html.escape(data.get('generated_at','?'))}
   </p>
+  <p class="sub-head" style="margin-top:-14px">{banner} &nbsp; {drift}</p>
 
   <div class="tiles">
     {tile(f"{booted}/{total}", "vms booted", "good" if booted == total else "bad")}
@@ -201,8 +357,8 @@ def render(data: dict) -> str:
   <div class="tablewrap">
     <table>
       <thead><tr>
-        <th>distro</th><th>kernel</th><th>falco driver</th><th>status</th>
-        <th>rss</th><th>cpu</th><th>start</th><th>detect</th><th>checks</th>
+        <th>distro</th><th>kernel</th><th>falco</th><th>driver</th><th>status</th>
+        <th>rss</th><th>cpu</th><th>start</th><th>detect</th><th>checks</th><th>vs last run</th>
       </tr></thead>
       <tbody>{''.join(rows)}</tbody>
     </table>
@@ -235,9 +391,18 @@ def main() -> int:
         sys.exit(f"No results at {args.results}. Run provision.py first.")
 
     data = json.loads(args.results.read_text())
+
+    # Order matters: find the previous run BEFORE archiving this one, or the
+    # report would always be diffing against itself.
+    prev = load_previous(data.get("generated_at", ""))
+    archive_run(data)
+    upstream = fetch_upstream()
+
     args.out.parent.mkdir(parents=True, exist_ok=True)
-    args.out.write_text(render(data))
-    print(f"wrote {args.out}  ({args.out.stat().st_size/1024:.0f} KB)")
+    args.out.write_text(render(data, prev=prev, upstream=upstream))
+    n_runs = len(list(RUNS_DIR.glob("run-*.json"))) if RUNS_DIR.is_dir() else 0
+    print(f"wrote {args.out}  ({args.out.stat().st_size/1024:.0f} KB, "
+          f"{n_runs} run(s) in history)")
     return 0
 
 
