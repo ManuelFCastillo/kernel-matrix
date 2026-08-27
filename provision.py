@@ -616,6 +616,19 @@ def run_falco_probe(distro: Distro, ip: str) -> dict:
 # ---------------------------------------------------------------------------
 # JUnit XML output
 # ---------------------------------------------------------------------------
+def _xml_safe(text: str) -> str:
+    """
+    Strip characters XML 1.0 forbids (control chars other than tab/nl/cr).
+
+    Check messages come straight from journalctl and package managers, which
+    emit ANSI colour escapes. ElementTree will happily WRITE \\x1b into an
+    attribute and then any parser -- including Jenkins' junit step -- rejects
+    the whole file as not well-formed, killing reporting for that distro.
+    Found by tests/test_provision.py, not by a 2am build failure, for once.
+    """
+    return re.sub("[^\\x09\\x0A\\x0D\\x20-\\uD7FF\\uE000-\\uFFFD]", "", text or "")
+
+
 def write_junit(result: RunResult, path: Path) -> None:
     """
     Emit JUnit XML.
@@ -640,7 +653,8 @@ def write_junit(result: RunResult, path: Path) -> None:
         case = ET.SubElement(suite, "testcase", {
             "name": "vm_provisioning", "classname": result.distro, "time": "0",
         })
-        ET.SubElement(case, "error", {"message": result.error}).text = result.error
+        err = _xml_safe(result.error)
+        ET.SubElement(case, "error", {"message": err}).text = err
 
     for check in result.checks:
         case = ET.SubElement(suite, "testcase", {
@@ -649,12 +663,13 @@ def write_junit(result: RunResult, path: Path) -> None:
             "time": f"{check.duration:.2f}",
         })
         if check.skipped:
-            ET.SubElement(case, "skipped", {"message": check.message})
+            ET.SubElement(case, "skipped", {"message": _xml_safe(check.message)})
         elif not check.passed:
-            failure = ET.SubElement(case, "failure", {"message": check.message or "check failed"})
-            failure.text = f"{check.detail}\n\nOutput:\n{check.output}"
+            failure = ET.SubElement(case, "failure",
+                                    {"message": _xml_safe(check.message) or "check failed"})
+            failure.text = _xml_safe(f"{check.detail}\n\nOutput:\n{check.output}")
         if check.output:
-            ET.SubElement(case, "system-out").text = check.output
+            ET.SubElement(case, "system-out").text = _xml_safe(check.output)
 
     path.parent.mkdir(parents=True, exist_ok=True)
     ET.ElementTree(suite).write(path, encoding="utf-8", xml_declaration=True)

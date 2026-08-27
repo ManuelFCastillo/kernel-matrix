@@ -230,6 +230,31 @@ EOF
         }
 
         // ===================================================================
+        // STAGE 2.5 -- Unit tests for the lab's own code
+        //
+        // The matrix tests kernels; nothing here tested the code that DECIDES
+        // what those results mean. That gap shipped three confident-but-wrong
+        // dashboards (a crash loop reported as started, a oneshot helper's
+        // journal read as the sensor's, ANSI escapes corrupting JUnit XML).
+        // These run in under a second, before any VM boots: wrong logic
+        // should never get as far as spending two minutes of qemu time.
+        // ===================================================================
+        stage('Unit tests') {
+            steps {
+                sh '''
+                    set -eu
+                    python3 -m pytest tests/ -q --junitxml=results/unit-tests.xml
+                '''
+            }
+            post {
+                always {
+                    junit testResults: 'results/unit-tests.xml',
+                          allowEmptyResults: true
+                }
+            }
+        }
+
+        // ===================================================================
         // STAGE 3 -- The matrix itself
         //
         // 'matrix' is declarative Jenkins' built-in fan-out. It generates one
