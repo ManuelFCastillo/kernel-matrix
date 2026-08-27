@@ -170,3 +170,24 @@ def test_render_escapes_hostile_error_text():
         "error": '<script>alert(1)</script>'}
     html_out = report.render(run, upstream={})
     assert "<script>alert(1)</script>" not in html_out
+
+
+# ---------------------------------------------------------------------------
+# plugin_mode drift: the fix-landing detector
+# ---------------------------------------------------------------------------
+
+def test_plugin_mode_flip_to_stock_is_flagged_good():
+    # The day upstream ships the container-plugin fix, rows flip from
+    # workaround to stock -- the single event this feature exists to catch.
+    changes = report.diff_runs(_run(plugin_mode="workaround"),
+                               _run(plugin_mode="stock"))
+    assert ("good", "plugin workaround → stock") in changes["ubuntu-20.04"]
+
+
+def test_plugin_mode_absent_defaults_to_stock_no_false_drift():
+    # Runs recorded before the plugin_mode field existed must not diff as
+    # changed against new runs that say "stock" explicitly.
+    old = _run()
+    old["results"][0]["falco"].pop("plugin_mode", None)
+    new = _run(plugin_mode="stock")
+    assert report.diff_runs(old, new) == {}

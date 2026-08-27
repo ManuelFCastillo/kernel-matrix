@@ -567,7 +567,7 @@ def run_checks(distro: Distro, ip: str, checks: list[dict]) -> list[CheckResult]
 # ---------------------------------------------------------------------------
 # Falco: install a real eBPF security agent and characterise it
 # ---------------------------------------------------------------------------
-def run_falco_probe(distro: Distro, ip: str) -> dict:
+def run_falco_probe(distro: Distro, ip: str, plugin_so: Path | None = None) -> dict:
     """
     Push falco_probe.sh to the guest, run it as root, parse its JSON.
 
@@ -580,6 +580,19 @@ def run_falco_probe(distro: Distro, ip: str) -> dict:
     probe = Path(__file__).parent / "falco_probe.sh"
     if not probe.exists():
         return {"error": "falco_probe.sh not found next to provision.py"}
+
+    if plugin_so:
+        # A locally built container plugin to test in place of the shipped
+        # one (see upstream plugins#1500/#1501). The probe installs it after
+        # the falco package lands and reports plugin_mode="patched".
+        log(f"falco: uploading override plugin {plugin_so.name}")
+        up = subprocess.run(
+            ["scp", *SSH_OPTS, "-i", str(SSH_KEY), str(plugin_so),
+             f"{distro.ssh_user}@{ip}:/tmp/libcontainer-override.so"],
+            capture_output=True, text=True, timeout=120,
+        )
+        if up.returncode != 0:
+            return {"error": f"plugin upload failed: {up.stderr.strip()[:200]}"}
 
     log("falco: uploading probe")
     scp = subprocess.run(
@@ -680,7 +693,7 @@ def write_junit(result: RunResult, path: Path) -> None:
 # One distro, end to end
 # ---------------------------------------------------------------------------
 def test_distro(distro: Distro, checks: list[dict], keep: bool = False,
-                with_falco: bool = False) -> RunResult:
+                with_falco: bool = False, plugin_so: Path | None = None) -> RunResult:
     """
     The full lifecycle for a single distro.
 
@@ -724,7 +737,7 @@ def test_distro(distro: Distro, checks: list[dict], keep: bool = False,
                 break
 
         if with_falco:
-            result.falco = run_falco_probe(distro, ip)
+            result.falco = run_falco_probe(distro, ip, plugin_so=plugin_so)
             f = result.falco
             if f.get("error"):
                 log(f"falco: {f['error']}", "FAIL")
@@ -793,6 +806,10 @@ def main() -> int:
     parser.add_argument("--all", action="store_true", help="run every distro in the matrix")
     parser.add_argument("--list", action="store_true", help="print the matrix and exit")
     parser.add_argument("--keep", action="store_true", help="do not destroy the VM afterwards")
+    parser.add_argument("--plugin-so", type=Path, default=None,
+                        help="path to a locally built libcontainer.so to install "
+                             "over the shipped one (tests the plugins#1501 fix; "
+                             "rows report plugin_mode=patched)")
     parser.add_argument("--falco", action="store_true",
                         help="install Falco on each VM and characterise it (slow, ~5 min/distro)")
     args = parser.parse_args()
@@ -823,7 +840,8 @@ def main() -> int:
     ensure_dirs()
     ensure_ssh_key()
 
-    results = [test_distro(d, checks, keep=args.keep, with_falco=args.falco)
+    results = [test_distro(d, checks, keep=args.keep, with_falco=args.falco,
+                           plugin_so=args.plugin_so)
                for d in selected]
 
     for result in results:

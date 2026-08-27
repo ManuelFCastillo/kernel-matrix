@@ -4,3 +4,4 @@ observability/grafana/data/
 __pycache__/
 results/
 .xray-credentials
+artifacts/

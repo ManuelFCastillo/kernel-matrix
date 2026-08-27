@@ -149,6 +149,39 @@ Falco 0.40.0 + kmod runs and detects on kernel 3.10.
 
 ---
 
+
+## Finding 4 — the plugin's own glibc floor is 2.28 (independent of the resolv fix)
+
+Discovered while validating the fix: on Ubuntu 18.04 (glibc 2.27) the plugin
+fails differently — `version 'GLIBC_2.28' not found (required by
+libcontainer.so)`. That is the build-baseline floor of the plugin binary
+itself, and no linkage fix can lower it: even with PR #1501 merged, the
+shipped plugin cannot run on Ubuntu 18.04 or Amazon Linux 2 (2.26) — distros
+the Falco package itself still installs on. Same class of finding as the
+EL7 cutoff: a support boundary to document, not a bug to fix.
+
+## The probe's three plugin modes
+
+The probe no longer applies its workaround unconditionally — that would blind
+the matrix to exactly the bug it found. Each run now:
+
+1. tries **stock** first (what a customer gets),
+2. falls back to the **workaround** only on a libcontainer load failure
+   (either flavor), and records `plugin_mode` in the JSON,
+3. optionally runs **patched** (`provision.py --plugin-so <fixed .so>`) to
+   preview the post-fix world.
+
+Two dashboards are published: `report.html` (reality today: four distros on
+workaround, centos-7 stock on 0.40) and `report-patched.html` (the fix
+applied: three distros green on the patched plugin; 18.04 honestly still on
+workaround due to Finding 4). When upstream ships the fix, the main
+dashboard's rows flip workaround → stock on their own and the drift column
+reports it — the matrix detecting its own fix landing.
+
+Bonus cost datum from the patched runs: container enrichment costs roughly
+**35–50 MB RSS** per host (modern_ebpf: ~90 → ~130-140 MB; kmod: ~14 →
+~49 MB) — fleet-relevant, and invisible until the plugin actually ran.
+
 ## Harness bugs found and fixed (in our code, actual fixes)
 
 The matrix originally reported all five distros down. Three of those rows

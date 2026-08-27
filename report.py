@@ -141,6 +141,9 @@ def diff_runs(prev: dict | None, cur: dict) -> dict[str, list[tuple[str, str]]]:
         out = []
         if p.get("driver") != f.get("driver"):
             out.append(("warn", f"driver {p.get('driver') or '?'} → {f.get('driver') or '?'}"))
+        if (p.get("plugin_mode") or "stock") != (f.get("plugin_mode") or "stock"):
+            out.append(("good" if f.get("plugin_mode") == "stock" else "warn",
+                        f"plugin {p.get('plugin_mode') or 'stock'} → {f.get('plugin_mode') or 'stock'}"))
         if p.get("falco_version") != f.get("falco_version"):
             out.append(("warn", f"falco {p.get('falco_version') or '?'} → {f.get('falco_version') or '?'}"))
         if bool(p.get("detected")) != bool(f.get("detected")):
@@ -159,7 +162,8 @@ def diff_runs(prev: dict | None, cur: dict) -> dict[str, list[tuple[str, str]]]:
     return changes
 
 
-def render(data: dict, prev: dict | None = None, upstream: dict | None = None) -> str:
+def render(data: dict, prev: dict | None = None, upstream: dict | None = None,
+           variant: str = "") -> str:
     results = data.get("results", [])
     changes = diff_runs(prev, data)
 
@@ -183,6 +187,9 @@ def render(data: dict, prev: dict | None = None, upstream: dict | None = None) -
         stale = " (cached)" if upstream.get("stale") else ""
         banner = (f'<span class="pill good">up to date with upstream '
                   f'{html.escape(up_ver)}{stale}</span>')
+
+    variant_pill = (f' &nbsp; <span class="pill warn">{html.escape(variant)}</span>'
+                    if variant else "")
 
     if prev:
         n = sum(len(v) for v in changes.values())
@@ -241,6 +248,11 @@ def render(data: dict, prev: dict | None = None, upstream: dict | None = None) -
         cpu = falco.get("cpu_percent")
         cpu_txt = f"{cpu}%" if cpu not in (None, 0, "0") else "&mdash;"
 
+        pmode = falco.get("plugin_mode") or ("stock" if falco else "")
+        pmode_tone = {"stock": "good", "patched": "warn", "workaround": "bad"}.get(pmode, "")
+        pmode_cell = (f'<span class="pill {pmode_tone}">{html.escape(pmode)}</span>'
+                      if pmode and falco.get("installed") else '<span class="unit">&mdash;</span>')
+
         ver = falco.get("falco_version")
         ver_txt = html.escape(ver) if ver and ver != "unknown" else "&mdash;"
 
@@ -258,6 +270,7 @@ def render(data: dict, prev: dict | None = None, upstream: dict | None = None) -
           <td class="mono">{html.escape(r.get('kernel') or '&mdash;')}</td>
           <td class="mono">{ver_txt}</td>
           <td><span class="pill {tone}" title="{html.escape(driver_help)}">{driver_label}</span></td>
+          <td>{pmode_cell}</td>
           <td>{status}<div class="sub">{detail}</div></td>
           <td class="num">{rss_txt}</td>
           <td class="num">{cpu_txt}</td>
@@ -345,7 +358,7 @@ def render(data: dict, prev: dict | None = None, upstream: dict | None = None) -
     host running <span class="mono">{html.escape(data.get('host_kernel','?'))}</span> &middot;
     generated {html.escape(data.get('generated_at','?'))}
   </p>
-  <p class="sub-head" style="margin-top:-14px">{banner} &nbsp; {drift}</p>
+  <p class="sub-head" style="margin-top:-14px">{banner} &nbsp; {drift}{variant_pill}</p>
 
   <div class="tiles">
     {tile(f"{booted}/{total}", "vms booted", "good" if booted == total else "bad")}
@@ -357,7 +370,7 @@ def render(data: dict, prev: dict | None = None, upstream: dict | None = None) -
   <div class="tablewrap">
     <table>
       <thead><tr>
-        <th>distro</th><th>kernel</th><th>falco</th><th>driver</th><th>status</th>
+        <th>distro</th><th>kernel</th><th>falco</th><th>driver</th><th>plugin</th><th>status</th>
         <th>rss</th><th>cpu</th><th>start</th><th>detect</th><th>checks</th><th>vs last run</th>
       </tr></thead>
       <tbody>{''.join(rows)}</tbody>
@@ -385,6 +398,8 @@ def main() -> int:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--results", type=Path, default=Path("results/results.json"))
     ap.add_argument("--out", type=Path, default=Path("results/report.html"))
+    ap.add_argument("--variant", default="",
+                    help="label shown in the header (e.g. 'patched plugin build')")
     args = ap.parse_args()
 
     if not args.results.exists():
@@ -399,7 +414,8 @@ def main() -> int:
     upstream = fetch_upstream()
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
-    args.out.write_text(render(data, prev=prev, upstream=upstream))
+    args.out.write_text(render(data, prev=prev, upstream=upstream,
+                               variant=args.variant))
     n_runs = len(list(RUNS_DIR.glob("run-*.json"))) if RUNS_DIR.is_dir() else 0
     print(f"wrote {args.out}  ({args.out.stat().st_size/1024:.0f} KB, "
           f"{n_runs} run(s) in history)")

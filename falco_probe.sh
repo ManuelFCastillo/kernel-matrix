@@ -65,6 +65,8 @@ DETECTED=false
 DETECT_SECONDS=0
 RULE_MATCHED=""
 BPF_ERRORS=0
+PLUGIN_MODE="stock"     # stock | patched | workaround -- how the container
+                        # plugin situation was handled on this host
 ERROR=""
 
 emit_and_exit() {
@@ -84,6 +86,7 @@ emit_and_exit() {
   "detect_seconds": $DETECT_SECONDS,
   "rule_matched": "$(json_safe "$RULE_MATCHED")",
   "bpf_load_errors": ${BPF_ERRORS:-0},
+  "plugin_mode": "$(json_safe "$PLUGIN_MODE")",
   "error": "$(json_safe "$ERROR")"
 }
 JSON
@@ -233,27 +236,44 @@ FALCO_VERSION=$(falco --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' 
 FALCO_VERSION=${FALCO_VERSION:-unknown}
 say "version: $FALCO_VERSION"
 
-# Disable the container-enrichment plugin. It links against a glibc resolver
-# symbol (__res_search) that isn't present the same way on every distro in
-# this matrix -- on the older ones Falco loads it, crashes at startup, and
-# systemd restarts it forever. This lab characterises kernel/eBPF
-# compatibility, not container metadata, so the plugin buys nothing and
-# costs a permanent crash loop. Remove its drop-in before the unit starts.
-if [ -f /etc/falco/config.d/falco.container_plugin.yaml ]; then
-    rm -f /etc/falco/config.d/falco.container_plugin.yaml
-    say "disabled container plugin (glibc symbol mismatch on older distros)"
+# ---------------------------------------------------------------------------
+# The container plugin situation, in three modes.
+#
+# Falco's bundled container plugin fails to dlopen on glibc < 2.34 (missing
+# -lresolv at link time -> no DT_NEEDED for libresolv.so.2; upstream:
+# falcosecurity/plugins#1500, fix PR #1501). Since the default ruleset
+# requires the plugin, stock Falco cannot start at all on those hosts.
+#
+#   stock       try the shipped package exactly as a customer gets it.
+#               ALWAYS attempted first: the probe must measure reality, and
+#               the day upstream ships the fix, rows flip to stock on their
+#               own -- which is precisely the event the matrix should catch.
+#   patched     /tmp/libcontainer-override.so was provided (a locally built
+#               plugin with the fix): install it over the shipped one, then
+#               proceed exactly as stock. Used to preview the fixed world.
+#   workaround  the stock attempt failed WITH the known symbol error:
+#               disable the plugin and swap in a self-contained ruleset so
+#               the rest of the characterisation can still run. Recorded in
+#               the JSON so the dashboard shows which rows needed it.
+# ---------------------------------------------------------------------------
+# Replace, never introduce: only install the override where a shipped
+# libcontainer.so already exists. Falco 0.40 (the EL7 fallback) predates the
+# plugin entirely -- copying one in would label the row "patched" for a
+# binary nothing ever loads.
+if [ -f /tmp/libcontainer-override.so ] && [ -f /usr/share/falco/plugins/libcontainer.so ]; then
+    cp /tmp/libcontainer-override.so /usr/share/falco/plugins/libcontainer.so
+    PLUGIN_MODE="patched"
+    say "installed override container plugin (patched build)"
 fi
 
-# The default falco_rules.yaml doesn't just gate on the container plugin at
-# the top of the file -- individual rule conditions (via shared macros) refer
-# to container.* fields directly. With the plugin disabled, those fields don't
-# exist and rule compilation fails outright: "filter_check called with
-# nonexistent field container.id". Patching the gate alone isn't enough.
-#
-# This probe only needs ONE thing: a rule that fires when /etc/shadow is read.
-# Rather than fight the default ruleset's container dependencies, replace it
-# with a single self-contained rule that has none.
-cat > /etc/falco/probe_rules.yaml <<'RULES'
+apply_plugin_workaround() {
+    # The default falco_rules.yaml doesn't just gate on the plugin at the top
+    # of the file -- rule conditions reference container.* fields through
+    # shared macros, so with the plugin disabled, rule compilation fails
+    # outright ("nonexistent field container.id"). Replace the ruleset with
+    # one self-contained rule; the probe only needs a /etc/shadow read to fire.
+    rm -f /etc/falco/config.d/falco.container_plugin.yaml
+    cat > /etc/falco/probe_rules.yaml <<'RULES'
 - rule: Sensitive File Read Probe
   desc: Detect a read of /etc/shadow (synthetic trigger for kernel-matrix characterisation)
   condition: (evt.type in (open, openat, openat2)) and fd.name=/etc/shadow
@@ -261,14 +281,15 @@ cat > /etc/falco/probe_rules.yaml <<'RULES'
   priority: WARNING
   tags: [filesystem, probe]
 RULES
-# sed, not python3/perl: minimal cloud images can't be trusted to have
-# either interpreter installed (Rocky's does not ship perl by default), but
-# every distro here ships GNU sed as part of the base system.
-sed -i '/^rules_files:/,/^$/c\
+    # sed, not python3/perl: minimal cloud images can't be trusted to have
+    # either interpreter (Rocky ships no perl), but GNU sed is base everywhere.
+    sed -i '/^rules_files:/,/^$/c\
 rules_files:\
   - /etc/falco/probe_rules.yaml
 ' /etc/falco/falco.yaml
-say "replaced default ruleset with a minimal container-free probe rule"
+    PLUGIN_MODE="workaround"
+    say "applied plugin workaround (disabled container plugin, self-contained ruleset)"
+}
 
 # ---------------------------------------------------------------------------
 # 2. START, and find out WHICH DRIVER it chose
@@ -313,36 +334,69 @@ sed -i 's|^ExecReload=kill|ExecReload=/bin/kill|' \
     /lib/systemd/system/falco*.service 2>/dev/null
 systemctl daemon-reload 2>/dev/null
 
-# Nudge whichever ones are installed; only the viable one will stay up.
-for candidate in falco-modern-bpf.service falco-bpf.service falco-kmod.service falco.service; do
-    systemctl list-unit-files "$candidate" >/dev/null 2>&1 && \
-        systemctl enable --now "$candidate" >/dev/null 2>&1
-done
+try_start() {
+    # Nudge whichever ones are installed; only the viable one will stay up.
+    for candidate in falco-modern-bpf.service falco-bpf.service falco-kmod.service falco.service; do
+        systemctl list-unit-files "$candidate" >/dev/null 2>&1 && \
+            systemctl enable --now "$candidate" >/dev/null 2>&1
+    done
 
-UNIT=""
-STABLE=0
-for _ in $(seq 1 30); do
-    # Columns are UNIT LOAD ACTIVE SUB DESC; $4=="running" excludes oneshot
-    # helpers stuck in "exited" as well as crash-loopers mid-restart.
-    CANDIDATE=$(systemctl list-units 'falco*' --state=active --plain --no-legend 2>/dev/null \
-           | awk '$4 == "running" {print $1}' | grep -v falcoctl | head -1)
-    if [ -n "$CANDIDATE" ]; then
-        # A unit can show "active (running)" for a fraction of a second in the
-        # middle of a crash loop -- systemd restarts it, it dies again a moment
-        # later, and a single snapshot cannot tell the two apart. Require three
-        # consecutive 1s samples before trusting it; a genuine crash loop never
-        # survives that window, a real start does.
-        UNIT="$CANDIDATE"
-        STABLE=$((STABLE + 1))
-        if [ "$STABLE" -ge 3 ]; then STARTED=true; break; fi
-    else
-        STABLE=0
+    UNIT=""
+    STABLE=0
+    for _ in $(seq 1 30); do
+        # Columns are UNIT LOAD ACTIVE SUB DESC; $4=="running" excludes oneshot
+        # helpers stuck in "exited" as well as crash-loopers mid-restart.
+        CANDIDATE=$(systemctl list-units 'falco*' --state=active --plain --no-legend 2>/dev/null \
+               | awk '$4 == "running" {print $1}' | grep -v falcoctl | head -1)
+        if [ -n "$CANDIDATE" ]; then
+            # A unit can show "active (running)" for a fraction of a second in
+            # the middle of a crash loop -- systemd restarts it, it dies again
+            # a moment later, and a single snapshot cannot tell the two apart.
+            # Require three consecutive 1s samples before trusting it; a
+            # genuine crash loop never survives that window, a real start does.
+            UNIT="$CANDIDATE"
+            STABLE=$((STABLE + 1))
+            if [ "$STABLE" -ge 3 ]; then STARTED=true; return 0; fi
+        else
+            STABLE=0
+        fi
+        sleep 1
+    done
+    return 1
+}
+
+try_start || true
+
+# Stock (or patched) didn't come up. If the journals show the known
+# container-plugin symbol error, this is upstream bug plugins#1500, not a
+# kernel incompatibility: fall back to the workaround so the rest of the
+# characterisation still happens, and record that we did. Any OTHER failure
+# is left alone -- it is a finding, and papering over it here would put the
+# blind spot right back.
+if [ "$STARTED" != "true" ] && [ "$PLUGIN_MODE" != "workaround" ]; then
+    # Query the engine units explicitly and deep: a bare 'falco*' glob also
+    # matches falcoctl-artifact-follow, whose download chatter can push the
+    # actual load error out of a shallow tail window -- which made this
+    # fallback fire on rocky-8 but silently miss on both ubuntus and debian.
+    # Match ANY libcontainer load failure, not one specific symbol: the same
+    # plugin fails with "undefined symbol: __res_search" on glibc 2.28-2.33
+    # (missing -lresolv, plugins#1500) and with "version GLIBC_2.28 not
+    # found" on glibc < 2.28 (the plugin's build-baseline floor; Ubuntu
+    # 18.04, Amazon Linux 2). Both are the plugin blocking Falco, both get
+    # the same workaround, and grepping for just one of them cost a rerun.
+    if journalctl -u falco-modern-bpf -u falco-bpf -u falco-kmod -u falco.service \
+                  --no-pager -n 600 2>/dev/null | grep -q "cannot load plugin.*libcontainer"; then
+        say "stock start failed with the known plugin symbol error; retrying with workaround"
+        systemctl stop 'falco-modern-bpf' 'falco-bpf' 'falco-kmod' 'falco' >/dev/null 2>&1
+        systemctl reset-failed 'falco*' >/dev/null 2>&1
+        apply_plugin_workaround
+        try_start || true
     fi
-    sleep 1
-done
+fi
+
 UNIT=${UNIT:-falco.service}
 START_SECONDS=$(( $(date +%s) - start_ts ))
-say "started: $STARTED as $UNIT (${START_SECONDS}s)"
+say "started: $STARTED as $UNIT (${START_SECONDS}s, plugin: $PLUGIN_MODE)"
 
 if [ "$STARTED" != "true" ]; then
     # Nothing came up. Report WHICH engines were attempted and how each one
