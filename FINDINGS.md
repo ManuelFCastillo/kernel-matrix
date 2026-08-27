@@ -95,6 +95,21 @@ untouched: default ruleset validates, service runs under systemd, the stock
 sensitive-file rule fires, and the alert carries `container_id=host` —
 the plugin itself working, not merely not crashing.
 
+**Regression surface, checked empirically.** The patch changes zero lines
+of code — both hunks are linkage metadata, declaring a dependency the code
+always had. Verified:
+
+- glibc 2.31 (Debian 11, x86_64): broken → fixed, end to end under systemd,
+  stock rules firing, plugin enriching events
+- glibc 2.39 (Ubuntu 24.04, x86_64): stock plugin already worked; patched
+  plugin behaves identically — no regression
+- Linux arm64 (bullseye aarch64 container, built natively on Apple
+  Silicon): builds clean, same `NEEDED: libresolv.so.2`, symbol properly
+  versioned as `__res_search@GLIBC_2.17`
+- macOS and Windows: untouched by construction — the APPLE branch is
+  unchanged, ld64 ignores link order, and `WORKER_DEP` is never set on
+  Windows
+
 As of this writing the plugins repo has zero issues or PRs mentioning the
 problem: the fix is unclaimed.
 
