@@ -36,10 +36,27 @@ paths that a pass/fail matrix would never surface.
 (`/usr/share/falco/plugins/libcontainer.so`) fails to `dlopen` with
 `undefined symbol: __res_search` on any host with glibc older than 2.34 —
 which includes Debian 11 (2.31), the entire RHEL/Rocky/Alma 8 line (2.28),
-and Ubuntu 20.04 (2.31). In glibc 2.34 the resolver library was absorbed
-into libc and its symbols reshuffled; a plugin built on a modern machine
-records references that older glibc cannot satisfy. Classic
-build-on-newest, break-on-oldest.
+and Ubuntu 20.04 (2.31).
+
+**The mechanism (verified, not guessed).** The plugin links a Go static
+library whose cgo DNS resolver calls `res_search` from libresolv. In the
+plugin's CMake (`go-worker.cmake`), the `-lresolv` dependency is added only
+inside an `if(APPLE)` branch — there is no Linux equivalent. The shipped
+`.so` therefore carries an undefined `__res_search` with **no `DT_NEEDED`
+entry for `libresolv.so.2`** (its only NEEDED entries are `libc.so.6` and
+the loader — confirmed with `readelf -d`). On glibc ≥ 2.34, libresolv is
+merged into libc, which papers over the hole; on older glibc the symbol
+lives only in `libresolv.so.2`, which is never loaded. Upstream even builds
+on `debian:bullseye` specifically to keep old-glibc compatibility — this
+one missing link flag defeats that entire effort.
+
+**The smoking gun.** On a stock Debian 11 install, the same command run
+twice: plain `falco` exits with the symbol error; with
+`LD_PRELOAD=/lib/x86_64-linux-gnu/libresolv.so.2` it starts cleanly and
+opens the modern BPF probe. One environment variable — forcing exactly the
+library a `DT_NEEDED` entry would have loaded — flips broken to working.
+(The preload is also a usable stopgap for stock installs on affected
+distros, via a systemd drop-in.)
 
 **The compounding bug.** The default ruleset hard-requires the plugin
 (`required_plugin_versions: container`), and its rules reference
@@ -58,9 +75,12 @@ with one self-contained detection rule, then starts the service. Applied
 fresh on every run. The green matrix cells mean "runs and detects *with the
 container plugin disabled*" — stock 0.44.1 on these distros still crash-loops.
 
-**Where the real fix lives:** the plugin's build baseline (build against the
-oldest supported glibc, manylinux-style, or link the public resolver API).
-Not patchable on an installed host.
+**Where the real fix lives:** a ~6-line CMake change in
+`falcosecurity/plugins` — add a Linux branch to `go-worker.cmake` linking
+`resolv`, mirroring the existing APPLE branch. `libresolv.so.2` exists on
+old glibc (real library) and new (compat stub), so the added `DT_NEEDED` is
+safe everywhere. As of this writing the plugins repo has zero issues or PRs
+mentioning the problem: the fix is unclaimed.
 
 ## Finding 2 — shipped unit files will not load on systemd < 239
 
