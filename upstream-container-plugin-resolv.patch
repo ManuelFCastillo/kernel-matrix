@@ -1,0 +1,33 @@
+diff --git a/plugins/container/CMakeLists.txt b/plugins/container/CMakeLists.txt
+index 6fec820..7574e3c 100644
+--- a/plugins/container/CMakeLists.txt
++++ b/plugins/container/CMakeLists.txt
+@@ -65,7 +65,7 @@ endif()
+ target_include_directories(container PRIVATE ${CMAKE_BINARY_DIR}/src/ src/ ${PLUGIN_SDK_INCLUDE} ${PLUGIN_SDK_DEPS_INCLUDE} ${WORKER_INCLUDE})
+ 
+ # project linked libraries
+-target_link_libraries(container PRIVATE fmt::fmt-header-only ReflexLibStatic ${WORKER_DEP} ${WORKER_LIB})
++target_link_libraries(container PRIVATE fmt::fmt-header-only ReflexLibStatic ${WORKER_LIB} ${WORKER_DEP})
+ 
+ option(ENABLE_TESTS "Enable build of unit tests" ON)
+ 
+diff --git a/plugins/container/cmake/modules/go-worker.cmake b/plugins/container/cmake/modules/go-worker.cmake
+index 550a0d1..96a9c6d 100644
+--- a/plugins/container/cmake/modules/go-worker.cmake
++++ b/plugins/container/cmake/modules/go-worker.cmake
+@@ -25,6 +25,15 @@ if(APPLE)
+     find_library(RESOLV resolv REQUIRED)
+     find_library(CORE CoreFoundation REQUIRED)
+     set(WORKER_DEP ${SECURITY_FRAMEWORK} ${RESOLV} ${CORE})
++elseif(CMAKE_HOST_SYSTEM_NAME STREQUAL "Linux")
++    # The same Go >= 1.20 cgo-resolver requirement applies on Linux: the net
++    # package references res_search from libresolv. On glibc >= 2.34 the
++    # symbol happens to resolve through libc's compat exports, which masks a
++    # missing dependency; on older glibc (Debian 11, RHEL/Rocky/Alma 8,
++    # Ubuntu 20.04) it lives only in libresolv.so.2, and without a DT_NEEDED
++    # entry the plugin fails to dlopen with:
++    #   undefined symbol: __res_search
++    set(WORKER_DEP resolv)
+ endif()
+ set(WORKER_LIB ${CMAKE_SOURCE_DIR}/go-worker/libworker.a)
+ set(WORKER_INCLUDE ${CMAKE_SOURCE_DIR}/go-worker)

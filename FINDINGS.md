@@ -75,12 +75,28 @@ with one self-contained detection rule, then starts the service. Applied
 fresh on every run. The green matrix cells mean "runs and detects *with the
 container plugin disabled*" — stock 0.44.1 on these distros still crash-loops.
 
-**Where the real fix lives:** a ~6-line CMake change in
-`falcosecurity/plugins` — add a Linux branch to `go-worker.cmake` linking
-`resolv`, mirroring the existing APPLE branch. `libresolv.so.2` exists on
-old glibc (real library) and new (compat stub), so the added `DT_NEEDED` is
-safe everywhere. As of this writing the plugins repo has zero issues or PRs
-mentioning the problem: the fix is unclaimed.
+**The fix — built and verified end to end.** Two small CMake changes
+(`upstream-container-plugin-resolv.patch` in this repo):
+
+1. `go-worker.cmake`: a Linux branch setting `WORKER_DEP` to `resolv`,
+   mirroring the existing APPLE branch (whose comment already cites the
+   Go ≥ 1.20 cgo-resolver requirement — only the macOS half was written).
+2. `CMakeLists.txt`: link `${WORKER_LIB} ${WORKER_DEP}` in that order.
+   With the reverse order GNU ld discards `-lresolv` (nothing needs it yet
+   when it is processed) and the fix silently doesn't take — verified from
+   the generated link line. macOS never noticed because ld64 is
+   order-insensitive.
+
+Verified by rebuilding plugin v0.7.1 in upstream's own build baseline
+(`debian:bullseye`, glibc 2.31): the rebuilt `.so` gains
+`NEEDED: libresolv.so.2` and a properly versioned `__res_search@GLIBC_2.2.5`.
+Swapped onto a stock Falco 0.44.1 install on Debian 11 with everything else
+untouched: default ruleset validates, service runs under systemd, the stock
+sensitive-file rule fires, and the alert carries `container_id=host` —
+the plugin itself working, not merely not crashing.
+
+As of this writing the plugins repo has zero issues or PRs mentioning the
+problem: the fix is unclaimed.
 
 ## Finding 2 — shipped unit files will not load on systemd < 239
 
