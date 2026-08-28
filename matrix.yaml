@@ -204,6 +204,13 @@ checks:
       fallback path.
     command: uname -r
     min_kernel: "5.10"              # special: parsed and compared numerically
+    allow_failure: true             # informational, like btf_available: an old
+                                    # kernel below the floor is the FINDING this
+                                    # matrix exists to record, not a regression.
+                                    # Failing the build on it makes the legacy
+                                    # tier permanently red, which trains people
+                                    # to ignore the dashboard. Red should mean
+                                    # "something broke", not "3.10 is old".
 
   - name: btf_available
     description: >
@@ -218,17 +225,25 @@ checks:
     description: The service manager is up, so a sensor could install a unit file.
     command: systemctl is-system-running --wait || true
     expect_contains: running
+    allow_failure: true             # informational: EOL cloud images often boot
+                                    # "degraded" over unrelated dead units, which
+                                    # says nothing about sensor compatibility.
 
   - name: can_read_module_list
     description: >
       Sanity check that we can inspect loaded kernel modules. A sensor that
       ships a kernel module needs this to work.
-    command: lsmod | head -1
+    # lsmod lives in /sbin, which is NOT on a non-root user's PATH on EL7.
+    # Without this the check reports "command not found" and the whole
+    # RHEL-7 family looks broken -- a false failure from our own harness.
+    command: PATH="$PATH:/sbin:/usr/sbin" lsmod | head -1
     expect_contains: Module
 
   - name: package_manager_responds
     description: >
       Distro-agnostic check that the package manager is functional, since
       installing a sensor means installing a package.
-    command: (command -v apt-get && apt-get --version) || (command -v dnf && dnf --version) || (command -v zypper && zypper --version)
+    # yum matters: CentOS 7 and other EL7 hosts have no dnf, so a chain that
+    # only knows apt/dnf/zypper fails on them for no real reason.
+    command: (command -v apt-get && apt-get --version) || (command -v dnf && dnf --version) || (command -v yum && yum --version) || (command -v zypper && zypper --version)
     expect_contains: ""             # empty means "just needs exit code 0"
