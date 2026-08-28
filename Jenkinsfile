@@ -243,7 +243,15 @@ EOF
             steps {
                 sh '''
                     set -eu
-                    python3 -m pytest tests/ -q --junitxml=results/unit-tests.xml
+
+                    # Provision the test dependency here rather than assuming
+                    # the agent has it: Jenkins runs as its own user, so a
+                    # pip --user install done by a human account is invisible
+                    # to CI. A workspace venv with system site packages keeps
+                    # PyYAML from the OS and adds pytest locally.
+                    [ -d .venv ] || python3 -m venv --system-site-packages .venv
+                    ./.venv/bin/python -m pip install -q --disable-pip-version-check pytest
+                    ./.venv/bin/python -m pytest tests/ -q --junitxml=results/unit-tests.xml
                 '''
             }
             post {
