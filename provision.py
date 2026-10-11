@@ -140,6 +140,7 @@ class Distro:
     memory_mb: int = 2048
     vcpus: int = 2
     boot_timeout_sec: int = 300
+    firmware: str = "bios"          # "bios" or "uefi"
 
     @property
     def base_image(self) -> Path:
@@ -407,13 +408,16 @@ def boot_vm(distro: Distro, vm_name: str, overlay: Path, seed: Path) -> None:
     --noautoconsole   do not attach a console; this is unattended
     --network         default NAT network, so the VM gets a DHCP address
     --os-variant      lets libvirt pick sensible virtual hardware
+    --boot uefi       only when matrix.yaml asks for it (see rocky-9 there)
     """
+    firmware = ["--boot", "uefi"] if distro.firmware == "uefi" else []
     run([
         "virt-install",
         "--name", vm_name,
         "--memory", str(distro.memory_mb),
         "--vcpus", str(distro.vcpus),
         "--import",
+        *firmware,
         "--disk", f"path={overlay},format=qcow2,bus=virtio",
         "--disk", f"path={seed},device=cdrom",
         "--network", "network=default,model=virtio",
@@ -786,8 +790,47 @@ def load_matrix(path: Path) -> tuple[list[Distro], list[dict]]:
             memory_mb=merged.get("memory_mb", 2048),
             vcpus=merged.get("vcpus", 2),
             boot_timeout_sec=merged.get("boot_timeout_sec", 300),
+            firmware=merged.get("firmware", "bios"),
         ))
     return distros, data["checks"]
+
+
+# ---------------------------------------------------------------------------
+# Results JSON
+# ---------------------------------------------------------------------------
+def result_to_dict(r: RunResult) -> dict:
+    return {
+        "distro": r.distro,
+        "kernel": r.kernel,
+        "error": r.error,
+        "checks": [
+            {"name": c.name, "passed": c.passed, "skipped": c.skipped,
+             "message": c.message, "duration": round(c.duration, 2)}
+            for c in r.checks
+        ],
+        "falco": r.falco,
+    }
+
+
+def write_combined(rows: list[dict]) -> None:
+    payload = {
+        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "host_kernel": subprocess.run(["uname", "-r"], capture_output=True,
+                                      text=True).stdout.strip(),
+        "results": rows,
+    }
+    (RESULTS / "results.json").write_text(json.dumps(payload, indent=2))
+    log(f"wrote {RESULTS / 'results.json'} ({len(rows)} distro(s))")
+
+
+def merge_results() -> int:
+    """Combine every results/<distro>.result.json into results.json."""
+    files = sorted(RESULTS.glob("*.result.json"))
+    if not files:
+        log("no per-distro results to merge", "WARN")
+        return 0
+    write_combined([json.loads(f.read_text()) for f in files])
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -812,7 +855,13 @@ def main() -> int:
                              "rows report plugin_mode=patched)")
     parser.add_argument("--falco", action="store_true",
                         help="install Falco on each VM and characterise it (slow, ~5 min/distro)")
+    parser.add_argument("--merge-results", action="store_true",
+                        help="combine results/*.result.json into results/results.json "
+                             "and exit (Jenkins runs this after the parallel matrix)")
     args = parser.parse_args()
+
+    if args.merge_results:
+        return merge_results()
 
     distros, checks = load_matrix(args.matrix)
 
@@ -847,29 +896,18 @@ def main() -> int:
     for result in results:
         write_junit(result, RESULTS / f"{result.distro}.xml")
 
-    # A single JSON file feeds both the HTML report and the metrics exporter.
-    # JUnit is for Jenkins; this is for everything else.
-    payload = {
-        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
-        "host_kernel": subprocess.run(["uname", "-r"], capture_output=True,
-                                      text=True).stdout.strip(),
-        "results": [
-            {
-                "distro": r.distro,
-                "kernel": r.kernel,
-                "error": r.error,
-                "checks": [
-                    {"name": c.name, "passed": c.passed, "skipped": c.skipped,
-                     "message": c.message, "duration": round(c.duration, 2)}
-                    for c in r.checks
-                ],
-                "falco": r.falco,
-            }
-            for r in results
-        ],
-    }
-    (RESULTS / "results.json").write_text(json.dumps(payload, indent=2))
-    log(f"wrote {RESULTS / 'results.json'}")
+    # One JSON file per distro, then the combined results.json that feeds
+    # both the HTML report and the metrics exporter. JUnit is for Jenkins;
+    # this is for everything else.
+    #
+    # The per-distro files exist because Jenkins runs one provision.py per
+    # distro, in parallel, in the same workspace. When each of those wrote
+    # results.json directly, the last to finish overwrote the rest. Jenkins
+    # now calls --merge-results once in Publish instead.
+    rows = [result_to_dict(r) for r in results]
+    for row in rows:
+        (RESULTS / f"{row['distro']}.result.json").write_text(json.dumps(row, indent=2))
+    write_combined(rows)
 
     # ---- summary -------------------------------------------------------
     print()

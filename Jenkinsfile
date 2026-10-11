@@ -35,11 +35,35 @@
 //
 //     Lint          seconds, free       -> runs on every build, gates the rest
 //     Fast matrix   ~3 min, 3 VMs       -> runs on every build
-//     Full matrix   ~8 min, 6 VMs       -> nightly, or when asked
+//     All tiers     11 VMs + Falco      -> nightly, or when asked
 //
 //  That ordering is the whole point. You do not spend eight minutes of VM time
 //  discovering something a two-second syntax check would have caught.
 // ===========================================================================
+
+// ---------------------------------------------------------------------------
+// Nightly override
+//
+// A cron-triggered build gets the parameter DEFAULTS, and the defaults are
+// the cheap ones (fast tier, no Falco). Left alone, that meant the nightly
+// build booted three modern VMs and never installed Falco at all: green every
+// night while testing none of the thing this project exists to test.
+//
+// So a timer-triggered build ignores the parameters and runs everything with
+// Falco on. A human clicking "Build with Parameters" still gets exactly what
+// they picked.
+// ---------------------------------------------------------------------------
+def isNightly() {
+    return !currentBuild.getBuildCauses('hudson.triggers.TimerTrigger$TimerTriggerCause').isEmpty()
+}
+
+def effectiveTier() {
+    return isNightly() ? 'all' : params.TIER
+}
+
+def falcoEnabled() {
+    return isNightly() || params.RUN_FALCO
+}
 
 pipeline {
 
@@ -61,7 +85,9 @@ pipeline {
     options {
         // A hung VM must never block an executor forever. Without this, one
         // stuck boot ties up the machine until somebody notices.
-        timeout(time: 45, unit: 'MINUTES')
+        // Sized for the nightly: 11 VMs in parallel with Falco, where the
+        // slowest (centos-7) needs ~7 min to boot and ~5 more for Falco.
+        timeout(time: 60, unit: 'MINUTES')
 
         // Keep 30 builds of history. Test result trends need history to be
         // useful, but unbounded history eats the Jenkins home directory.
@@ -140,6 +166,10 @@ pipeline {
         // scraper comes looking.
         PUSHGATEWAY = 'http://localhost:9092'
 
+        // Where Publish copies the report for the km-report container to
+        // serve. observability/docker-compose.yml mounts this path.
+        KM_PUBLISH_DIR = "${env.HOME}/km-published"
+
         // Never buffer python output. Without this, Jenkins shows you nothing
         // for eight minutes and then dumps everything at once, which makes a
         // running build indistinguishable from a hung one.
@@ -157,6 +187,15 @@ pipeline {
         // ===================================================================
         stage('Preflight') {
             steps {
+                echo "tier=${effectiveTier()} falco=${falcoEnabled()} nightly=${isNightly()}"
+
+                // The workspace persists between builds. Without this, a
+                // distro skipped this build would still have last build's
+                // JSON sitting in results/ and get merged into tonight's
+                // report as if it had run. results/runs/ is kept: it is the
+                // history the report diffs against.
+                sh 'mkdir -p results && rm -f results/*.xml results/*.result.json results/results.json results/report.html'
+
                 sh '''
                     set -eu
 
@@ -283,7 +322,7 @@ EOF
                         // so the UI still shows the skipped ones as skipped
                         // rather than hiding them.
                         values 'ubuntu-22.04', 'ubuntu-24.04', 'debian-12',
-                               'rocky-9', 'almalinux-9', 'fedora-40',
+                               'rocky-9', 'almalinux-9', 'fedora-44',
                                'ubuntu-20.04', 'debian-11', 'rocky-8',
                                'ubuntu-18.04', 'centos-7'
                     }
@@ -309,18 +348,18 @@ EOF
                 // build its axis, so the axis is static and this filters it.
                 when {
                     anyOf {
-                        expression { params.TIER == 'all' }
+                        expression { effectiveTier() == 'all' }
                         expression {
-                            params.TIER == 'fast' &&
+                            effectiveTier() == 'fast' &&
                             ['ubuntu-22.04', 'ubuntu-24.04', 'debian-12'].contains(env.DISTRO)
                         }
                         expression {
-                            params.TIER == 'full' &&
+                            effectiveTier() == 'full' &&
                             ['ubuntu-22.04', 'ubuntu-24.04', 'debian-12',
-                             'rocky-9', 'almalinux-9', 'fedora-40'].contains(env.DISTRO)
+                             'rocky-9', 'almalinux-9', 'fedora-44'].contains(env.DISTRO)
                         }
                         expression {
-                            params.TIER == 'legacy' &&
+                            effectiveTier() == 'legacy' &&
                             ['ubuntu-20.04', 'debian-11', 'rocky-8',
                              'ubuntu-18.04', 'centos-7'].contains(env.DISTRO)
                         }
@@ -332,15 +371,23 @@ EOF
                         steps {
                             // Give each distro its own timeout. Without this a
                             // single wedged boot would eat the whole pipeline
-                            // budget and starve the others.
-                            timeout(time: 12, unit: 'MINUTES') {
-                                sh """
-                                    set -eu
-                                    python3 provision.py \\
-                                        --distro '${DISTRO}' \\
-                                        ${params.RUN_FALCO ? '--falco' : ''} \\
-                                        ${params.KEEP_VMS ? '--keep' : ''}
-                                """
+                            // budget and starve the others. Falco adds ~5 min on
+                            // top of a boot that takes up to 7 on centos-7.
+                            //
+                            // catchError: a failed distro marks its stage and
+                            // the build red but lets the pipeline carry on to
+                            // Publish. Without it, one 404'd image skipped
+                            // Publish and the whole night's results were lost.
+                            catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
+                                timeout(time: falcoEnabled() ? 25 : 12, unit: 'MINUTES') {
+                                    sh """
+                                        set -eu
+                                        python3 provision.py \\
+                                            --distro '${DISTRO}' \\
+                                            ${falcoEnabled() ? '--falco' : ''} \\
+                                            ${params.KEEP_VMS ? '--keep' : ''}
+                                    """
+                                }
                             }
                         }
                         post {
@@ -379,13 +426,23 @@ EOF
 
                     # Merge the per-distro JSON that each matrix branch wrote.
                     # Matrix branches run in parallel and each writes its own
-                    # file, so the merge happens here rather than in any one
-                    # branch.
+                    # results/<distro>.result.json, so the merge happens here rather
+                    # than in any one branch. (Each branch used to write
+                    # results.json directly; the last one to finish won, and
+                    # the report and Grafana only ever saw one distro.)
+                    python3 provision.py --merge-results
                     python3 report.py || echo "no results.json to render"
 
                     # Metrics are best-effort. A missing pushgateway must not
                     # fail a build whose actual job was testing kernels.
                     python3 push_metrics.py --gateway "${PUSHGATEWAY}" || true
+
+                    # Hand the finished report to the km-report nginx container
+                    # (http://hardac2:8087). The workspace is not a stable path
+                    # to mount, so publish to a fixed directory Jenkins owns.
+                    mkdir -p "${KM_PUBLISH_DIR}"
+                    cp results/*.xml results/results.json "${KM_PUBLISH_DIR}/" 2>/dev/null || true
+                    cp results/report.html "${KM_PUBLISH_DIR}/" 2>/dev/null || true
                 '''
             }
             post {

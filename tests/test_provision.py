@@ -136,3 +136,39 @@ def test_load_matrix_applies_defaults_and_overrides(tmp_path):
     assert d.ssh_user == "ubuntu"        # per-distro override wins
     assert d.memory_mb == 2048           # default applies
     assert len(checks) == 1
+
+
+# ---------------------------------------------------------------------------
+# results merging -- Jenkins runs one provision.py per distro in parallel
+# ---------------------------------------------------------------------------
+
+def test_merge_combines_every_parallel_branch(tmp_path, monkeypatch):
+    # Each matrix branch used to write results.json itself, so the last one
+    # to finish overwrote the rest and every dashboard showed one distro.
+    monkeypatch.setattr(provision, "RESULTS", tmp_path)
+    for name in ("debian-12", "ubuntu-22.04", "rocky-9"):
+        r = RunResult(distro=name)
+        (tmp_path / f"{name}.result.json").write_text(
+            provision.json.dumps(provision.result_to_dict(r)))
+    (tmp_path / "upstream_cache.json").write_text("{}")   # must be ignored
+
+    assert provision.merge_results() == 0
+    merged = provision.json.loads((tmp_path / "results.json").read_text())
+    assert [r["distro"] for r in merged["results"]] == ["debian-12", "rocky-9", "ubuntu-22.04"]
+
+
+def test_merge_with_nothing_to_merge_writes_nothing(tmp_path, monkeypatch):
+    monkeypatch.setattr(provision, "RESULTS", tmp_path)
+    assert provision.merge_results() == 0
+    assert not (tmp_path / "results.json").exists()
+
+
+def test_load_matrix_firmware_defaults_to_bios(tmp_path):
+    p = tmp_path / "matrix.yaml"
+    p.write_text(
+        "distros:\n"
+        "  - {name: a, image_url: u, ssh_user: x, expect_kernel: 5}\n"
+        "  - {name: b, image_url: u, ssh_user: x, expect_kernel: 5, firmware: uefi}\n"
+        "checks: []\n")
+    distros, _ = provision.load_matrix(p)
+    assert [d.firmware for d in distros] == ["bios", "uefi"]

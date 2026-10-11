@@ -90,7 +90,9 @@ services:
     ports:
       - "8087:80"
     volumes:
-      - ${KM_RESULTS:-../results}:/usr/share/nginx/html:ro
+      # Jenkins' Publish stage copies each build's report here. Set
+      # KM_RESULTS=../results to view a hand run from provision.py instead.
+      - ${KM_RESULTS:-/var/lib/jenkins/km-published}:/usr/share/nginx/html:ro
       - ./nginx-report.conf:/etc/nginx/conf.d/default.conf:ro
 
 volumes:
