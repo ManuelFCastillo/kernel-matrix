@@ -102,7 +102,11 @@ faults:
       build; on hosts with headers Falco may fall back to kmod, and the
       effectiveness check reports that instead of a false label.
     evidence_patterns:
+      # Either order: libbpf says "failed to find valid kernel BTF", with
+      # the noun last. The first version only matched noun-first, missed
+      # that line, and denied gpt-oss credit for citing exactly it.
       - "(?i)btf.*(fail|error|not found|unable|missing|invalid)"
+      - "(?i)(fail|error|unable|missing|invalid).*btf"
       - "^crw.* /sys/kernel/btf/vmlinux$"
     script: |
       mount --bind /dev/null /sys/kernel/btf/vmlinux
