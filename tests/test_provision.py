@@ -172,3 +172,58 @@ def test_load_matrix_firmware_defaults_to_bios(tmp_path):
         "checks: []\n")
     distros, _ = provision.load_matrix(p)
     assert [d.firmware for d in distros] == ["bios", "uefi"]
+
+
+# ---------------------------------------------------------------------------
+# Falco probe -> checks: the probe result must reach JUnit, not just the log
+# ---------------------------------------------------------------------------
+
+def _by_name(checks):
+    return {c.name: c for c in checks}
+
+
+def test_falco_healthy_is_three_passes():
+    checks = provision.falco_checks({"installed": True, "started": True,
+                                     "detected": True, "error": ""})
+    assert [c.name for c in checks] == ["falco_installs", "falco_starts",
+                                        "falco_detects_event"]
+    assert all(c.passed and not c.skipped for c in checks)
+
+
+def test_falco_install_failure_fails_once_and_skips_the_rest():
+    # ubuntu-18.04/20.04 in nightlies 57-61: one root failure, not three.
+    probe = {"installed": False, "started": False, "detected": False,
+             "error": "dpkg: error processing package falco (--configure):",
+             "error_detail": "Setting up falco | post-installation script returned error exit status 1"}
+    c = _by_name(provision.falco_checks(probe))
+    assert not c["falco_installs"].passed and not c["falco_installs"].skipped
+    assert "dpkg" in c["falco_installs"].message
+    assert "post-installation" in c["falco_installs"].output
+    assert c["falco_starts"].skipped and c["falco_detects_event"].skipped
+
+
+def test_falco_running_but_blind_is_a_failure():
+    # The quiet failure mode: started, no error string, never alerted.
+    c = _by_name(provision.falco_checks({"installed": True, "started": True,
+                                         "detected": False, "error": ""}))
+    assert c["falco_starts"].passed
+    assert not c["falco_detects_event"].passed and not c["falco_detects_event"].skipped
+
+
+def test_falco_probe_harness_error_fails_install_check():
+    # A timeout or unparseable probe output has no "installed" key at all.
+    c = _by_name(provision.falco_checks({"error": "probe timed out after 15 minutes"}))
+    assert not c["falco_installs"].passed
+    assert "timed out" in c["falco_installs"].message
+
+
+def test_falco_failure_reaches_junit_and_counts(tmp_path):
+    r = _result(checks=[_check()] + provision.falco_checks(
+        {"installed": False, "error": "dpkg: error processing package falco"}))
+    out = tmp_path / "out.xml"
+    provision.write_junit(r, out)
+    suite = ET.parse(out).getroot()
+    assert suite.get("tests") == "4"
+    assert suite.get("failures") == "1"
+    assert suite.get("skipped") == "2"
+    assert r.failed == 1

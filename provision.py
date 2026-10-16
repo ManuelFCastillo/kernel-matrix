@@ -630,6 +630,49 @@ def run_falco_probe(distro: Distro, ip: str, plugin_so: Path | None = None) -> d
                 "raw": proc.stdout[-400:]}
 
 
+def falco_checks(falco: dict, duration: float = 0.0) -> list[CheckResult]:
+    """
+    Turn the probe's JSON into checks, so Falco outcomes reach JUnit and the
+    exit code.
+
+    Without this the probe result only ever reached the log and results.json.
+    Falco failed to install on ubuntu-18.04 and ubuntu-20.04 for five nightlies
+    straight (builds 57-61) while the summary printed "all 6 checks passed"
+    and every build stayed green.
+
+    The stages gate each other: a step that was never reached is SKIPPED,
+    not failed, so one install failure reads as one failure and not three.
+    """
+    detail = falco.get("error_detail") or falco.get("raw") or ""
+    error = falco.get("error") or ""
+
+    def check(name: str, passed: bool, message: str = "", skipped: bool = False) -> CheckResult:
+        return CheckResult(name=name, passed=passed, skipped=skipped,
+                           duration=duration if name == "falco_installs" else 0.0,
+                           message=message, detail=detail if not passed else "",
+                           output=detail if not passed and not skipped else "")
+
+    stages = [
+        ("falco_installs", falco.get("installed") is True,
+         error or "falco package did not install"),
+        ("falco_starts", falco.get("started") is True,
+         error or "falco installed but never reached active"),
+        ("falco_detects_event", falco.get("detected") is True,
+         error or "falco running but did not alert on the synthetic event"),
+    ]
+    out: list[CheckResult] = []
+    blocked_by = ""
+    for name, ok, why in stages:
+        if blocked_by:
+            out.append(check(name, False, f"not reached: {blocked_by} failed", skipped=True))
+        elif ok:
+            out.append(check(name, True))
+        else:
+            out.append(check(name, False, why))
+            blocked_by = name
+    return out
+
+
 # ---------------------------------------------------------------------------
 # JUnit XML output
 # ---------------------------------------------------------------------------
@@ -741,14 +784,20 @@ def test_distro(distro: Distro, checks: list[dict], keep: bool = False,
                 break
 
         if with_falco:
+            probe_start = time.monotonic()
             result.falco = run_falco_probe(distro, ip, plugin_so=plugin_so)
+            result.checks.extend(falco_checks(result.falco, time.monotonic() - probe_start))
             f = result.falco
             if f.get("error"):
                 log(f"falco: {f['error']}", "FAIL")
+                for line in (f.get("error_detail") or "").split(" | "):
+                    if line:
+                        log(f"  | {line}", "FAIL")
             else:
                 log(f"falco: driver={f.get('driver')} "
                     f"started={f.get('started')} detected={f.get('detected')} "
-                    f"rss={f.get('rss_kb')}KB", "PASS")
+                    f"rss={f.get('rss_kb')}KB",
+                    "PASS" if f.get("detected") else "FAIL")
 
         return result
 

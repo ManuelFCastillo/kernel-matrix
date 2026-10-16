@@ -41,7 +41,7 @@ say() { echo "[probe] $*" >&2; }
 # those straight into the payload produces "Invalid control character at line N"
 # on the far side -- which silently destroyed two distros' results before this
 # existed. Strip control characters, collapse whitespace, escape backslashes
-# and quotes, then truncate.
+# and quotes, then truncate (to $2 characters, default 200).
 json_safe() {
     printf '%s' "$1" \
         | sed -E 's/\x1b\[[0-9;]*[a-zA-Z]//g' \
@@ -49,7 +49,17 @@ json_safe() {
         | tr -d '\000-\037' \
         | sed 's/\\/\\\\/g; s/"/\\"/g' \
         | tr -s ' ' \
-        | cut -c1-200
+        | cut -c1-"${2:-200}"
+}
+
+# The last lines of a failed install, joined with " | " because json_safe
+# strips newlines. ERROR keeps the one-line headline; this keeps the reason.
+# "dpkg: error processing package falco (--configure)" alone said WHAT failed
+# on ubuntu-18.04/20.04 for five nightlies and never WHY.
+tail_detail() {
+    printf '%s\n' "$1" | grep -v -e '^[[:space:]]*$' -e '^(Reading database' \
+        | tail -n 20 \
+        | awk 'BEGIN { ORS = " | " } { print }' | sed 's/ | $//'
 }
 
 # --- results, filled in as we go -------------------------------------------
@@ -68,6 +78,7 @@ BPF_ERRORS=0
 PLUGIN_MODE="stock"     # stock | patched | workaround -- how the container
                         # plugin situation was handled on this host
 ERROR=""
+ERROR_DETAIL=""          # tail of the failing command, see tail_detail
 
 emit_and_exit() {
     # One JSON object. Keep key names stable: the report and the metrics
@@ -87,7 +98,8 @@ emit_and_exit() {
   "rule_matched": "$(json_safe "$RULE_MATCHED")",
   "bpf_load_errors": ${BPF_ERRORS:-0},
   "plugin_mode": "$(json_safe "$PLUGIN_MODE")",
-  "error": "$(json_safe "$ERROR")"
+  "error": "$(json_safe "$ERROR")",
+  "error_detail": "$(json_safe "$ERROR_DETAIL" 2000)"
 }
 JSON
     exit 0
@@ -153,6 +165,7 @@ if command -v apt-get >/dev/null 2>&1; then
         ERROR=$(echo "$APT_ERR" | grep -iE "^E:|error|not found" | head -1 \
                 | tr -d '"' | cut -c1-160)
         ERROR=${ERROR:-"apt install falco failed"}
+        ERROR_DETAIL=$(tail_detail "$APT_ERR")
     fi
 
 elif command -v yum >/dev/null 2>&1 && ! command -v dnf >/dev/null 2>&1; then
@@ -200,6 +213,7 @@ elif command -v yum >/dev/null 2>&1 && ! command -v dnf >/dev/null 2>&1; then
     else
         ERROR=$(echo "$YUM_ERR" | grep -iE "error|cannot|failed|No package" | head -1)
         ERROR=${ERROR:-"yum install falco failed"}
+        ERROR_DETAIL=$(tail_detail "$YUM_ERR")
     fi
 
 elif command -v dnf >/dev/null 2>&1; then
@@ -214,6 +228,7 @@ elif command -v dnf >/dev/null 2>&1; then
     else
         ERROR=$(echo "$DNF_ERR" | grep -iE "error|cannot|conflict|nothing provides" | head -1)
         ERROR=${ERROR:-"dnf install falco failed"}
+        ERROR_DETAIL=$(tail_detail "$DNF_ERR")
     fi
 
 elif command -v zypper >/dev/null 2>&1; then
