@@ -96,6 +96,7 @@ OVERLAYS = LAB_ROOT / "overlays"      # per-run thin disks, deleted after
 SEEDS = LAB_ROOT / "seeds"            # cloud-init ISOs
 RESULTS = Path("results")             # JUnit XML for Jenkins
 EVIDENCE = RESULTS / "evidence"       # per-distro evidence bundles, see collect_evidence
+FAULT_RESULTS = RESULTS / "faults"    # fault runs: kept out of results.json and the report
 
 SSH_KEY = Path.home() / ".ssh" / "id_ed25519_kmatrix"
 
@@ -169,6 +170,7 @@ class RunResult:
     kernel: str = ""               # the kernel we actually observed
     checks: list[CheckResult] = field(default_factory=list)
     falco: dict | None = None      # characterisation from falco_probe.sh
+    fault: dict | None = None      # injected fault and whether it took effect, see faults.yaml
     error: str | None = None       # set when the VM never came up at all
 
     @property
@@ -286,7 +288,7 @@ def preflight() -> None:
 
 
 def ensure_dirs() -> None:
-    for d in (BASE_IMAGES, OVERLAYS, SEEDS, RESULTS):
+    for d in (BASE_IMAGES, OVERLAYS, SEEDS, RESULTS, FAULT_RESULTS):
         d.mkdir(parents=True, exist_ok=True)
 
 
@@ -575,7 +577,7 @@ def run_checks(distro: Distro, ip: str, checks: list[dict]) -> list[CheckResult]
 # Falco: install a real eBPF security agent and characterise it
 # ---------------------------------------------------------------------------
 def run_falco_probe(distro: Distro, ip: str, plugin_so: Path | None = None,
-                    evidence_dir: Path | None = None) -> dict:
+                    evidence_dir: Path | None = None, fault: dict | None = None) -> dict:
     """
     Push falco_probe.sh to the guest, run it as root, parse its JSON.
 
@@ -611,6 +613,22 @@ def run_falco_probe(distro: Distro, ip: str, plugin_so: Path | None = None,
     if scp.returncode != 0:
         return {"error": f"scp failed: {scp.stderr.strip()[:200]}"}
 
+    if fault:
+        # The probe sources /tmp/km-fault.sh between install and start, then
+        # deletes it. Uploaded under a neutral name via a temp file so the
+        # snippet never appears on a command line in the guest's journal.
+        log(f"fault: uploading {fault['id']}")
+        snippet = LAB_ROOT / f"fault-{os.getpid()}.sh"
+        snippet.write_text(fault["script"])
+        try:
+            up = subprocess.run(["scp", *SSH_OPTS, "-i", str(SSH_KEY), str(snippet),
+                                 f"{distro.ssh_user}@{ip}:/tmp/km-fault.sh"],
+                                capture_output=True, text=True, timeout=60)
+        finally:
+            snippet.unlink(missing_ok=True)
+        if up.returncode != 0:
+            return {"error": f"fault upload failed: {up.stderr.strip()[:200]}"}
+
     log("falco: installing and characterising (this takes a few minutes)")
     try:
         proc = ssh_exec(
@@ -635,6 +653,35 @@ def run_falco_probe(distro: Distro, ip: str, plugin_so: Path | None = None,
     except (ValueError, json.JSONDecodeError) as exc:
         return {"error": f"could not parse probe output: {exc}",
                 "raw": proc.stdout[-400:]}
+
+
+def load_faults(path: Path) -> dict[str, dict]:
+    """faults.yaml -> {id: fault}. Every fault must name what it breaks and how to tell."""
+    data = yaml.safe_load(path.read_text())
+    faults = {}
+    for f in data["faults"]:
+        missing = {"id", "root_cause", "expect_failed_check", "script"} - set(f)
+        if missing:
+            raise ValueError(f"fault {f.get('id', '?')}: missing {', '.join(sorted(missing))}")
+        faults[f["id"]] = f
+    return faults
+
+
+def fault_outcome(fault: dict, checks: list[CheckResult]) -> dict:
+    """
+    Did the fault break what it claims to break? A fault that leaves its
+    target check green is a harness bug, not a case: labelling that run with
+    the fault's root cause would put a wrong answer key in the benchmark.
+    """
+    failed = [c.name for c in checks if not c.passed and not c.skipped]
+    return {
+        "id": fault["id"],
+        "root_cause": fault["root_cause"],
+        "expect_failed_check": fault["expect_failed_check"],
+        "evidence_patterns": fault.get("evidence_patterns", []),
+        "failed_checks": failed,
+        "effective": fault["expect_failed_check"] in failed,
+    }
 
 
 def falco_checks(falco: dict, duration: float = 0.0) -> list[CheckResult]:
@@ -788,6 +835,7 @@ def build_manifest(result: RunResult, distro: Distro, dest: Path,
         "failed_checks": failed,
         "checks": [{"name": c.name, "passed": c.passed, "skipped": c.skipped}
                    for c in result.checks],
+        "fault": result.fault,
         "collection_complete": collected,
         "collected_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "git_sha": _git_sha(),
@@ -865,7 +913,8 @@ def write_junit(result: RunResult, path: Path) -> None:
 # One distro, end to end
 # ---------------------------------------------------------------------------
 def test_distro(distro: Distro, checks: list[dict], keep: bool = False,
-                with_falco: bool = False, plugin_so: Path | None = None) -> RunResult:
+                with_falco: bool = False, plugin_so: Path | None = None,
+                fault: dict | None = None) -> RunResult:
     """
     The full lifecycle for a single distro.
 
@@ -909,14 +958,16 @@ def test_distro(distro: Distro, checks: list[dict], keep: bool = False,
                 break
 
         if with_falco:
-            evidence_dir = EVIDENCE / distro.name
+            evidence_dir = EVIDENCE / (f"{distro.name}--{fault['id']}" if fault else distro.name)
             shutil.rmtree(evidence_dir, ignore_errors=True)
             evidence_dir.mkdir(parents=True)
 
             probe_start = time.monotonic()
             result.falco = run_falco_probe(distro, ip, plugin_so=plugin_so,
-                                           evidence_dir=evidence_dir)
+                                           evidence_dir=evidence_dir, fault=fault)
             result.checks.extend(falco_checks(result.falco, time.monotonic() - probe_start))
+            if fault:
+                result.fault = fault_outcome(fault, result.checks)
 
             # After the checks, so the manifest records the final outcome.
             collected = collect_evidence(distro, ip, evidence_dir)
@@ -993,6 +1044,7 @@ def result_to_dict(r: RunResult) -> dict:
             for c in r.checks
         ],
         "falco": r.falco,
+        "fault": r.fault,
     }
 
 
@@ -1039,6 +1091,11 @@ def main() -> int:
                              "rows report plugin_mode=patched)")
     parser.add_argument("--falco", action="store_true",
                         help="install Falco on each VM and characterise it (slow, ~5 min/distro)")
+    parser.add_argument("--fault", metavar="ID",
+                        help="apply a fault from faults.yaml between install and start "
+                             "(needs --falco and --distro); see faults.yaml")
+    parser.add_argument("--faults", type=Path, default=Path(__file__).parent / "faults.yaml")
+    parser.add_argument("--list-faults", action="store_true", help="print the fault catalog and exit")
     parser.add_argument("--merge-results", action="store_true",
                         help="combine results/*.result.json into results/results.json "
                              "and exit (Jenkins runs this after the parallel matrix)")
@@ -1046,6 +1103,20 @@ def main() -> int:
 
     if args.merge_results:
         return merge_results()
+
+    if args.list_faults:
+        for f in load_faults(args.faults).values():
+            print(f"{f['id']:<18}{f['root_cause']:<26}breaks {f['expect_failed_check']}")
+        return 0
+
+    fault = None
+    if args.fault:
+        faults = load_faults(args.faults)
+        if args.fault not in faults:
+            sys.exit(f"No fault named {args.fault!r}. Try --list-faults.")
+        if not (args.falco and args.distro):
+            sys.exit("--fault needs --falco and a single --distro.")
+        fault = faults[args.fault]
 
     distros, checks = load_matrix(args.matrix)
 
@@ -1074,8 +1145,11 @@ def main() -> int:
     ensure_ssh_key()
 
     results = [test_distro(d, checks, keep=args.keep, with_falco=args.falco,
-                           plugin_so=args.plugin_so)
+                           plugin_so=args.plugin_so, fault=fault)
                for d in selected]
+
+    if fault:
+        return report_fault_run(results[0])
 
     for result in results:
         write_junit(result, RESULTS / f"{result.distro}.xml")
@@ -1110,6 +1184,32 @@ def main() -> int:
             log(f"  {result.distro:<18} all {len(result.checks)} checks passed", "PASS")
 
     return exit_code
+
+
+def report_fault_run(result: RunResult) -> int:
+    """
+    A fault run succeeds when the fault broke what it said it would. Its
+    results go to results/faults/, never into results.json: a deliberately
+    broken row in the nightly dashboard would read as a regression.
+    """
+    name = f"{result.distro}--{result.fault['id']}" if result.fault else result.distro
+    write_junit(result, FAULT_RESULTS / f"{name}.xml")
+    (FAULT_RESULTS / f"{name}.result.json").write_text(
+        json.dumps(result_to_dict(result), indent=2))
+    print()
+    log("=" * 70)
+    log("SUMMARY (fault run)")
+    log("=" * 70)
+    if result.error or not result.fault:
+        log(f"  {name:<34} ERROR  {(result.error or 'no fault outcome')[:60]}", "ERROR")
+        return 1
+    f = result.fault
+    if f["effective"]:
+        log(f"  {name:<34} fault took effect: {f['expect_failed_check']} failed", "PASS")
+        return 0
+    log(f"  {name:<34} INEFFECTIVE: {f['expect_failed_check']} did not fail "
+        f"(failed: {', '.join(f['failed_checks']) or 'nothing'})", "FAIL")
+    return 1
 
 
 if __name__ == "__main__":

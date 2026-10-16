@@ -148,12 +148,37 @@ not a joke.
 
 ---
 
+## Evidence bundles and fault injection
+
+Every Falco run leaves `results/evidence/<distro>/`: journal, package logs, install
+scripts, kernel capabilities, plugin linkage, each section headed by the command that
+produced it, plus a `manifest.json` (outcome, git SHA, build, sha256 per file). Jenkins
+archives them, so a red row can be diagnosed without re-running it.
+
+A natural failure has no answer key until someone root-causes it. A fault applied on
+purpose does, which makes it a labelled case for
+triage benchmarks (can a model, or a script, diagnose the failure from the bundle?):
+
+```bash
+python3 provision.py --list-faults
+python3 provision.py --distro debian-12 --falco --fault exec_permission
+```
+
+Each fault in `faults.yaml` runs as root between install and start, silently, and names
+the check it must break. If that check stays green the fault did not take effect: the run
+exits 1 and the bundle is marked ineffective, so it never becomes a labelled case. Fault
+runs write to `results/faults/`, never into `results.json` or the dashboard.
+
+---
+
 ## Layout
 
 ```
 matrix.yaml          the compatibility matrix, as data not code
 provision.py         boot, wait, check, characterise, destroy
 falco_probe.sh       runs inside the guest; emits JSON
+collect_evidence.sh  runs inside the guest after the probe; read-only evidence bundle
+faults.yaml          deliberate, verified breakage for labelled triage cases
 report.py            results.json -> self-contained HTML; archives every run,
                      diffs against the previous one ("vs last run" column),
                      and checks GitHub for untested upstream Falco releases

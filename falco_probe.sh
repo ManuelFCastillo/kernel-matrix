@@ -335,6 +335,25 @@ rules_files:\
 #
 # Guessing from which unit FILES exist is wrong, because several exist on
 # every install. Ask systemd which one is actually ACTIVE -- and running.
+# Deliberate breakage for labelled triage cases (faults.yaml, provision.py
+# --fault). Applied here, after install and before start, and SILENTLY: the
+# probe log and JSON are evidence a model reads, and a line saying what was
+# broken would hand it the answer. The snippet is deleted once sourced.
+FAULT_ACTIVE=""
+if [ -f /tmp/km-fault.sh ]; then
+    # Debian's postinst has already STARTED falco-modern-bpf by now. A fault
+    # aimed at startup (exec bit, config, limits) applied under a running
+    # process changes nothing, and try_start below would just find it
+    # running: the first fault runs all came back "ineffective" for exactly
+    # this reason. Stop everything so the fault meets a real start.
+    systemctl stop 'falco*' >/dev/null 2>&1
+    systemctl reset-failed 'falco*' >/dev/null 2>&1
+    # shellcheck disable=SC1091
+    . /tmp/km-fault.sh >/dev/null 2>&1
+    rm -f /tmp/km-fault.sh
+    FAULT_ACTIVE=1
+fi
+
 start_ts=$(date +%s)
 
 # Falco's shipped unit files say "ExecReload=kill -1 $MAINPID" -- a
@@ -388,7 +407,9 @@ try_start || true
 # characterisation still happens, and record that we did. Any OTHER failure
 # is left alone -- it is a finding, and papering over it here would put the
 # blind spot right back.
-if [ "$STARTED" != "true" ] && [ "$PLUGIN_MODE" != "workaround" ]; then
+# Never under an injected fault: the workaround would "fix" a deliberately
+# broken plugin and report the row healthy.
+if [ "$STARTED" != "true" ] && [ "$PLUGIN_MODE" != "workaround" ] && [ -z "$FAULT_ACTIVE" ]; then
     # Query the engine units explicitly and deep: a bare 'falco*' glob also
     # matches falcoctl-artifact-follow, whose download chatter can push the
     # actual load error out of a shallow tail window -- which made this

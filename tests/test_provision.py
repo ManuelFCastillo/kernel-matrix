@@ -7,6 +7,7 @@ these tests cover the decisions made BEFORE and AFTER that talking, which
 is where a wrong answer silently corrupts every downstream report.
 """
 
+import re
 import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -294,3 +295,66 @@ def test_manifest_vm_error_outranks_checks(tmp_path):
     r = _result(error="SSH never became available")
     d = provision.Distro(name="x", image_url="x", ssh_user="u", expect_kernel="5")
     assert provision.build_manifest(r, d, tmp_path, collected=False)["outcome"] == "error"
+
+
+# ---------------------------------------------------------------------------
+# Fault injection: the catalog is valid, and a fault must prove it took effect
+# ---------------------------------------------------------------------------
+
+FAULTS = Path(__file__).resolve().parent.parent / "faults.yaml"
+TAXONOMY = {"NO_DEFECT", "PACKAGE_DEPENDENCY_UNMET", "PACKAGE_SCRIPT_FAILED",
+            "PLUGIN_LOAD_FAILED", "KERNEL_FEATURE_MISSING", "DRIVER_BUILD_FAILED",
+            "SERVICE_EXEC_FAILED", "SERVICE_CONFIG_INVALID", "INIT_SYSTEM_INCOMPATIBLE",
+            "RESOURCE_LIMIT", "RULES_NOT_LOADED", "HARNESS_ERROR", "OTHER"}
+
+
+def test_fault_catalog_is_well_formed():
+    import re
+    faults = provision.load_faults(FAULTS)
+    assert len(faults) >= 6
+    for f in faults.values():
+        assert f["root_cause"] in TAXONOMY
+        assert f["expect_failed_check"] in {"falco_installs", "falco_starts",
+                                            "falco_detects_event"}
+        for pattern in f.get("evidence_patterns", []):
+            re.compile(pattern)
+
+
+def test_fault_snippets_leave_no_fingerprints():
+    # Evidence is read by models. A snippet that writes "fault", "inject" or
+    # "kernel-matrix" anywhere would let a model find the answer by spotting
+    # our marker instead of diagnosing.
+    for f in provision.load_faults(FAULTS).values():
+        assert not re.search(r"(?i)fault|inject|kernel-matrix|km-", f["script"]), f["id"]
+
+
+def test_fault_snippets_are_valid_bash(tmp_path):
+    import subprocess
+    for f in provision.load_faults(FAULTS).values():
+        script = tmp_path / f"{f['id']}.sh"
+        script.write_text(f["script"])
+        proc = subprocess.run(["bash", "-n", str(script)], capture_output=True, text=True)
+        assert proc.returncode == 0, (f["id"], proc.stderr)
+
+
+def test_fault_effective_only_when_its_target_check_fails():
+    fault = {"id": "exec_permission", "root_cause": "SERVICE_EXEC_FAILED",
+             "expect_failed_check": "falco_starts", "script": "true"}
+    broke = provision.fault_outcome(fault, provision.falco_checks(
+        {"installed": True, "started": False, "detected": False, "error": "x"}))
+    assert broke["effective"] and broke["failed_checks"] == ["falco_starts"]
+
+    absorbed = provision.fault_outcome(fault, provision.falco_checks(
+        {"installed": True, "started": True, "detected": True, "error": ""}))
+    assert not absorbed["effective"]
+
+    wrong_stage = provision.fault_outcome(fault, provision.falco_checks(
+        {"installed": False, "error": "dpkg"}))
+    assert not wrong_stage["effective"]          # broke install, not start
+
+
+def test_load_faults_rejects_incomplete_entries(tmp_path):
+    bad = tmp_path / "faults.yaml"
+    bad.write_text("faults:\n  - id: half\n    root_cause: OTHER\n")
+    with pytest.raises(ValueError, match="expect_failed_check"):
+        provision.load_faults(bad)

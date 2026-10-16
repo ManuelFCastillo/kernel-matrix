@@ -74,6 +74,12 @@ cap falco.txt "ls -l /usr/share/falco/plugins"
 # and `ldd` shows it statically.
 cap falco.txt "for so in /usr/share/falco/plugins/*.so; do echo \"== \$so\"; ldd -r \"\$so\" 2>&1 | grep -E 'not found|undefined|libresolv|libc.so'; done"
 cap falco.txt "grep -vE '^\s*(#|$)' /etc/falco/falco.yaml | head -n 80"
+cap falco.txt "tail -n 15 /etc/falco/falco.yaml"
+cap falco.txt "ls -l /etc/falco /etc/falco/rules.d /etc/falco/config.d"
+cap falco.txt "cat /etc/falco/falco_rules.local.yaml /etc/falco/rules.d/*.yaml"
+# systemctl cat prints each unit WITH its drop-ins, which is where a changed
+# limit or ExecStart hides.
+cap falco.txt "systemctl cat falco-modern-bpf.service falco-bpf.service falco-kmod.service"
 
 cap journal.log "journalctl -u 'falco*' --no-pager -o short-iso -n 400"
 cap dmesg.log "dmesg | tail -n 200"

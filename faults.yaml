@@ -1,0 +1,108 @@
+# =============================================================================
+#  faults.yaml -- deliberate, known breakage for real VMs
+# =============================================================================
+#
+#  The matrix finds natural failures, but a natural failure has no answer
+#  key until someone root-causes it by hand. A fault applied on purpose does:
+#  we know what we broke. These runs are the labelled cases for triage
+#  benchmarks (see the sensorlab repo).
+#
+#  Each fault is a shell snippet run as root inside the guest AFTER Falco is
+#  installed and BEFORE the probe starts it. Rules for writing one:
+#
+#    - Break one thing, the way it breaks in the field. No markers: nothing
+#      in the evidence may say "fault", "inject" or "kernel-matrix". A model
+#      that finds the answer by spotting our fingerprints has learned nothing.
+#    - Silent: output is discarded, and the probe never mentions it.
+#    - Verified: expect_failed_check names the check the fault must make
+#      fail. If that check passes, the fault did not take effect, the run
+#      exits non-zero, and the bundle is marked ineffective so it never
+#      becomes a labelled case.
+#
+#  While a fault is active the probe's plugin workaround is off: it exists
+#  to route around upstream plugins#1500, and would otherwise "fix" an
+#  injected plugin failure and report a healthy row.
+#
+#  root_cause is a sensorlab taxonomy code. evidence_patterns are regexes;
+#  bundle lines matching them become the case's key evidence, i.e. the lines
+#  a correct diagnosis should cite.
+# =============================================================================
+
+faults:
+  - id: exec_permission
+    root_cause: SERVICE_EXEC_FAILED
+    expect_failed_check: falco_starts
+    description: The falco binary lost its execute bit (a bad chmod in a config-management run).
+    evidence_patterns:
+      - "Permission denied"
+      - "203/EXEC"
+    script: |
+      chmod 0644 /usr/bin/falco
+
+  - id: config_malformed
+    root_cause: SERVICE_CONFIG_INVALID
+    expect_failed_check: falco_starts
+    description: falco.yaml has an unterminated YAML sequence appended (a botched templating step).
+    evidence_patterns:
+      - "Cannot read config file"
+      - "yaml-cpp: error"
+      - "^rules_files: \\[$"
+    script: |
+      printf '\nrules_files: [\n' >> /etc/falco/falco.yaml
+
+  - id: rules_disabled
+    root_cause: RULES_NOT_LOADED
+    expect_failed_check: falco_detects_event
+    description: A local rules override disables the sensitive-file rules; Falco runs but is blind to the event.
+    evidence_patterns:
+      - "rule: Read sensitive file"
+    script: |
+      cat >> /etc/falco/falco_rules.local.yaml <<'EOF'
+
+      - rule: Read sensitive file untrusted
+        enabled: false
+        override:
+          enabled: replace
+
+      - rule: Read sensitive file trusted after startup
+        enabled: false
+        override:
+          enabled: replace
+      EOF
+
+  - id: fd_limit
+    root_cause: RESOURCE_LIMIT
+    expect_failed_check: falco_starts
+    description: A unit override caps open files far below what Falco needs.
+    evidence_patterns:
+      - "LimitNOFILE=16"
+      - "(?i)too many open files"
+    script: |
+      for unit in falco-modern-bpf falco-bpf falco-kmod; do
+        mkdir -p /etc/systemd/system/$unit.service.d
+        printf '[Service]\nLimitNOFILE=16\n' > /etc/systemd/system/$unit.service.d/override.conf
+      done
+      systemctl daemon-reload
+
+  - id: plugin_corrupt
+    root_cause: PLUGIN_LOAD_FAILED
+    expect_failed_check: falco_starts
+    description: The container plugin shared object is truncated (a partial package write or disk fault).
+    evidence_patterns:
+      - "libcontainer"
+    script: |
+      truncate -s 4096 /usr/share/falco/plugins/libcontainer.so
+
+  - id: btf_hidden
+    root_cause: KERNEL_FEATURE_MISSING
+    expect_failed_check: falco_starts
+    description: >-
+      Kernel BTF is unavailable to the modern eBPF engine (simulated by masking
+      /sys/kernel/btf/vmlinux). Only meaningful where no fallback driver can
+      build; on hosts with headers Falco may fall back to kmod, and the
+      effectiveness check reports that instead of a false label.
+    evidence_patterns:
+      - "(?i)btf.*(fail|error|not found|unable|missing|invalid)"
+      - "^crw.* /sys/kernel/btf/vmlinux$"
+    script: |
+      mount --bind /dev/null /sys/kernel/btf/vmlinux
