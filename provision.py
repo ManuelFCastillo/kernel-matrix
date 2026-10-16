@@ -42,12 +42,14 @@ Verify with:  virsh list --all      (should work without sudo)
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+import tarfile
 import time
 import urllib.request
 import xml.etree.ElementTree as ET
@@ -93,6 +95,7 @@ BASE_IMAGES = LAB_ROOT / "base"       # downloaded once, read-only afterwards
 OVERLAYS = LAB_ROOT / "overlays"      # per-run thin disks, deleted after
 SEEDS = LAB_ROOT / "seeds"            # cloud-init ISOs
 RESULTS = Path("results")             # JUnit XML for Jenkins
+EVIDENCE = RESULTS / "evidence"       # per-distro evidence bundles, see collect_evidence
 
 SSH_KEY = Path.home() / ".ssh" / "id_ed25519_kmatrix"
 
@@ -571,7 +574,8 @@ def run_checks(distro: Distro, ip: str, checks: list[dict]) -> list[CheckResult]
 # ---------------------------------------------------------------------------
 # Falco: install a real eBPF security agent and characterise it
 # ---------------------------------------------------------------------------
-def run_falco_probe(distro: Distro, ip: str, plugin_so: Path | None = None) -> dict:
+def run_falco_probe(distro: Distro, ip: str, plugin_so: Path | None = None,
+                    evidence_dir: Path | None = None) -> dict:
     """
     Push falco_probe.sh to the guest, run it as root, parse its JSON.
 
@@ -621,6 +625,9 @@ def run_falco_probe(distro: Distro, ip: str, plugin_so: Path | None = None) -> d
     # stdout, so we can parse stdout without filtering.
     for line in proc.stderr.splitlines():
         log(f"  {line}")
+    if evidence_dir:
+        (evidence_dir / "probe.log").write_text(proc.stderr)
+        (evidence_dir / "probe.json").write_text(proc.stdout)
 
     try:
         start = proc.stdout.index("{")
@@ -671,6 +678,124 @@ def falco_checks(falco: dict, duration: float = 0.0) -> list[CheckResult]:
             out.append(check(name, False, why))
             blocked_by = name
     return out
+
+
+# ---------------------------------------------------------------------------
+# Evidence bundles: what an engineer would look at after a run
+# ---------------------------------------------------------------------------
+# results.json says WHAT happened. The bundle keeps WHY: journal, package
+# logs, install scripts, kernel capabilities, plugin linkage. Without it the
+# only way to diagnose a red row was to re-run that distro with --keep and
+# ssh in. The bundle is also the raw material for triage tooling: plain text,
+# one "$ command" header per section, so any line can be cited by file and
+# line number.
+#
+# Collection is best effort and never changes a result: a bundle that could
+# not be gathered is logged and recorded in the manifest, nothing more.
+# ---------------------------------------------------------------------------
+EVIDENCE_SCHEMA = 1
+
+
+def _extract_flat(tgz: Path, dest: Path) -> list[str]:
+    """
+    Unpack regular files only, flattened to their basenames.
+
+    The tarball comes out of a guest we just let a package's install scripts
+    run as root on, so treat it as untrusted: no links, no devices, no
+    "../" paths, nothing written outside dest.
+    """
+    names = []
+    with tarfile.open(tgz) as tar:
+        for member in tar.getmembers():
+            name = Path(member.name).name
+            if not member.isfile() or not name or name.startswith("."):
+                continue
+            src = tar.extractfile(member)
+            if src is None:
+                continue
+            (dest / name).write_bytes(src.read())
+            names.append(name)
+    return sorted(names)
+
+
+def collect_evidence(distro: Distro, ip: str, dest: Path) -> bool:
+    """Run collect_evidence.sh in the guest and unpack its bundle into dest."""
+    script = Path(__file__).parent / "collect_evidence.sh"
+    target = f"{distro.ssh_user}@{ip}"
+    tgz = dest / "_bundle.tgz"
+    try:
+        up = subprocess.run(["scp", *SSH_OPTS, "-i", str(SSH_KEY), str(script),
+                             f"{target}:/tmp/collect_evidence.sh"],
+                            capture_output=True, text=True, timeout=60)
+        if up.returncode != 0:
+            log(f"evidence: upload failed: {up.stderr.strip()[:200]}", "WARN")
+            return False
+        proc = ssh_exec(ip, distro.ssh_user, "sudo bash /tmp/collect_evidence.sh",
+                        timeout=300)
+        if proc.returncode != 0:
+            log(f"evidence: collector exited {proc.returncode}: "
+                f"{proc.stderr.strip()[:200]}", "WARN")
+            return False
+        down = subprocess.run(["scp", *SSH_OPTS, "-i", str(SSH_KEY),
+                               f"{target}:/tmp/km-evidence.tgz", str(tgz)],
+                              capture_output=True, text=True, timeout=120)
+        if down.returncode != 0:
+            log(f"evidence: download failed: {down.stderr.strip()[:200]}", "WARN")
+            return False
+        names = _extract_flat(tgz, dest)
+        log(f"evidence: {len(names)} file(s) -> {dest}")
+        return True
+    except (subprocess.TimeoutExpired, OSError, tarfile.TarError) as exc:
+        log(f"evidence: {type(exc).__name__}: {exc}", "WARN")
+        return False
+    finally:
+        tgz.unlink(missing_ok=True)
+
+
+def _git_sha() -> str | None:
+    proc = subprocess.run(["git", "rev-parse", "HEAD"], cwd=Path(__file__).parent,
+                          capture_output=True, text=True)
+    return proc.stdout.strip() or None
+
+
+def build_manifest(result: RunResult, distro: Distro, dest: Path,
+                   collected: bool) -> dict:
+    """
+    Describe a bundle well enough to reproduce or audit it later: which run,
+    which commit, which kernel, what the checks said, and a hash per file so
+    a bundle quoted in a report can be proven unchanged.
+    """
+    files = {}
+    for path in sorted(dest.iterdir()):
+        if path.name == "manifest.json" or not path.is_file():
+            continue
+        data = path.read_bytes()
+        files[path.name] = {
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "bytes": len(data),
+            "lines": data.count(b"\n"),
+        }
+    failed = [c.name for c in result.checks if not c.passed and not c.skipped]
+    return {
+        "schema_version": EVIDENCE_SCHEMA,
+        "distro": distro.name,
+        "kernel": result.kernel,
+        "expect_kernel": distro.expect_kernel,
+        "tier": distro.tier,
+        "firmware": distro.firmware,
+        "falco_version": (result.falco or {}).get("falco_version"),
+        "outcome": "error" if result.error else ("fail" if failed else "pass"),
+        "failed_checks": failed,
+        "checks": [{"name": c.name, "passed": c.passed, "skipped": c.skipped}
+                   for c in result.checks],
+        "collection_complete": collected,
+        "collected_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "git_sha": _git_sha(),
+        "host_kernel": os.uname().release,
+        "jenkins": {k.lower(): os.environ.get(k)
+                    for k in ("JOB_NAME", "BUILD_NUMBER", "BUILD_TAG")},
+        "files": files,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -784,9 +909,19 @@ def test_distro(distro: Distro, checks: list[dict], keep: bool = False,
                 break
 
         if with_falco:
+            evidence_dir = EVIDENCE / distro.name
+            shutil.rmtree(evidence_dir, ignore_errors=True)
+            evidence_dir.mkdir(parents=True)
+
             probe_start = time.monotonic()
-            result.falco = run_falco_probe(distro, ip, plugin_so=plugin_so)
+            result.falco = run_falco_probe(distro, ip, plugin_so=plugin_so,
+                                           evidence_dir=evidence_dir)
             result.checks.extend(falco_checks(result.falco, time.monotonic() - probe_start))
+
+            # After the checks, so the manifest records the final outcome.
+            collected = collect_evidence(distro, ip, evidence_dir)
+            manifest = build_manifest(result, distro, evidence_dir, collected)
+            (evidence_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
             f = result.falco
             if f.get("error"):
                 log(f"falco: {f['error']}", "FAIL")

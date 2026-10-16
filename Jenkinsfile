@@ -193,8 +193,10 @@ pipeline {
                 // distro skipped this build would still have last build's
                 // JSON sitting in results/ and get merged into tonight's
                 // report as if it had run. results/runs/ is kept: it is the
-                // history the report diffs against.
-                sh 'mkdir -p results && rm -f results/*.xml results/*.result.json results/results.json results/report.html'
+                // history the report diffs against. Evidence bundles go
+                // too, for the same reason: a stale bundle would describe a
+                // VM that did not run tonight.
+                sh 'mkdir -p results && rm -f results/*.xml results/*.result.json results/results.json results/report.html && rm -rf results/evidence'
 
                 sh '''
                     set -eu
@@ -475,6 +477,15 @@ EOF
                 artifacts: 'results/*.xml',
                 allowEmptyArchive: true,
                 fingerprint: true
+            )
+            // Evidence bundles (journal, package logs, install scripts,
+            // kernel capabilities) for every distro that ran Falco. Archived
+            // here, not in Publish, so a failed Publish cannot lose the
+            // evidence for the failure. A few hundred KB per distro; the
+            // 30-build logRotator bounds the total.
+            archiveArtifacts(
+                artifacts: 'results/evidence/**',
+                allowEmptyArchive: true
             )
         }
 

@@ -227,3 +227,70 @@ def test_falco_failure_reaches_junit_and_counts(tmp_path):
     assert suite.get("failures") == "1"
     assert suite.get("skipped") == "2"
     assert r.failed == 1
+
+
+# ---------------------------------------------------------------------------
+# Evidence bundles: safe unpacking and a manifest that can be audited
+# ---------------------------------------------------------------------------
+
+def _tgz_with(tmp_path, members):
+    """members: list of (name, kind, payload) with kind 'file' or 'symlink'."""
+    import io
+    import tarfile
+    tgz = tmp_path / "bundle.tgz"
+    with tarfile.open(tgz, "w:gz") as tar:
+        for name, kind, payload in members:
+            info = tarfile.TarInfo(name)
+            if kind == "symlink":
+                info.type = tarfile.SYMTYPE
+                info.linkname = payload
+                tar.addfile(info)
+            else:
+                data = payload.encode()
+                info.size = len(data)
+                tar.addfile(info, io.BytesIO(data))
+    return tgz
+
+
+def test_extract_flat_keeps_only_plain_files_inside_dest(tmp_path):
+    # The tarball comes out of a guest that just ran a package's install
+    # scripts as root. Nothing in it may land outside dest.
+    tgz = _tgz_with(tmp_path, [
+        ("km-evidence/journal.log", "file", "J1\n"),
+        ("km-evidence/../../escape.txt", "file", "nope"),
+        ("km-evidence/passwd", "symlink", "/etc/passwd"),
+        ("km-evidence/.hidden", "file", "x"),
+    ])
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    names = provision._extract_flat(tgz, dest)
+    assert names == ["escape.txt", "journal.log"]
+    assert not (tmp_path / "escape.txt").exists()
+    assert not (dest / "passwd").exists()
+    assert (dest / "journal.log").read_text() == "J1\n"
+
+
+def test_manifest_records_outcome_hashes_and_failed_checks(tmp_path):
+    import hashlib
+    (tmp_path / "journal.log").write_text("a\nb\n")
+    (tmp_path / "manifest.json").write_text("{}")      # never hashes itself
+    r = _result(kernel="5.4.0-216-generic",
+                checks=[_check()] + provision.falco_checks(
+                    {"installed": False, "error": "dpkg: error"}),
+                falco={"falco_version": "unknown"})
+    d = provision.Distro(name="ubuntu-20.04", image_url="x", ssh_user="ubuntu",
+                         expect_kernel="5.4", tier="legacy")
+    m = provision.build_manifest(r, d, tmp_path, collected=True)
+    assert m["outcome"] == "fail"
+    assert m["failed_checks"] == ["falco_installs"]
+    assert m["kernel"] == "5.4.0-216-generic" and m["tier"] == "legacy"
+    assert list(m["files"]) == ["journal.log"]
+    assert m["files"]["journal.log"] == {
+        "sha256": hashlib.sha256(b"a\nb\n").hexdigest(), "bytes": 4, "lines": 2}
+    assert m["collected_at"].endswith("Z")
+
+
+def test_manifest_vm_error_outranks_checks(tmp_path):
+    r = _result(error="SSH never became available")
+    d = provision.Distro(name="x", image_url="x", ssh_user="u", expect_kernel="5")
+    assert provision.build_manifest(r, d, tmp_path, collected=False)["outcome"] == "error"
