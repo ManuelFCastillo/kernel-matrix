@@ -226,11 +226,16 @@ pipeline {
 
                     echo "--- leftover VMs from previous runs ---"
                     # A previous build that died hard can leave domains behind.
-                    # Clean them up rather than colliding with them.
+                    # Reap only those whose owning process is gone: names are
+                    # km-<distro>-<pid>-<suffix>, and the qualify job and
+                    # interactive provision.py/qualify.py runs share this host.
                     for dom in $(virsh list --all --name | grep "^km-" || true); do
-                        echo "  reaping stale domain: $dom"
+                        pid=$(echo "$dom" | awk -F- '{print $(NF-1)}')
+                        [ -d "/proc/$pid" ] && continue
+                        echo "  reaping orphaned domain: $dom (pid $pid is gone)"
                         virsh destroy "$dom"  2>/dev/null || true
                         virsh undefine "$dom" --nvram 2>/dev/null || true
+                        rm -f "${KMATRIX_ROOT}/overlays/${dom}.qcow2" "${KMATRIX_ROOT}/seeds/${dom}"-*
                     done
                     echo "preflight OK"
                 '''
@@ -517,15 +522,17 @@ EOF
         cleanup {
             // Belt and braces. provision.py cleans up in its own finally block,
             // but if the process was killed outright (timeout, agent restart)
-            // nothing in Python got the chance to run.
+            // nothing in Python got the chance to run. Same rule as Preflight:
+            // only domains whose process is gone, and only their own files.
             sh '''
                 for dom in $(virsh list --all --name 2>/dev/null | grep "^km-" || true); do
+                    pid=$(echo "$dom" | awk -F- '{print $(NF-1)}')
+                    [ -d "/proc/$pid" ] && continue
                     echo "post-build cleanup: $dom"
                     virsh destroy "$dom"  2>/dev/null || true
                     virsh undefine "$dom" --nvram 2>/dev/null || true
+                    rm -f "${KMATRIX_ROOT}/overlays/${dom}.qcow2" "${KMATRIX_ROOT}/seeds/${dom}"-*
                 done
-                rm -f "${KMATRIX_ROOT}/overlays/"*.qcow2 2>/dev/null || true
-                rm -f "${KMATRIX_ROOT}/seeds/"*.iso 2>/dev/null || true
             '''
         }
     }
