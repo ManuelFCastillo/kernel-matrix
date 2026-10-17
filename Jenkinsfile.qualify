@@ -36,9 +36,9 @@
 //  and every red cell in it counts as new.
 // ===========================================================================
 
-// The versions this build qualifies, decided in Discover. A binding, not a
-// def, so every stage and post block sees the same list.
-toQualify = []
+// The versions this build qualifies, decided in Discover. Every stage,
+// when{} and post block closes over this one list.
+def toQualify = []
 
 pipeline {
     agent any
