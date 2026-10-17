@@ -13,6 +13,7 @@ import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from urllib.parse import parse_qsl
 
 import pytest
 
@@ -511,3 +512,185 @@ def test_strict_probe_json_carries_qualification_keys():
                 "scriptlet_failed", "base_exit", "base_state", "base_version",
                 "kmod_loaded", "bpf_prog_fds", "active_unit", "secure_boot"):
         assert f'"{key}":' in block, key
+
+
+# ---------------------------------------------------------------------------
+# --discover: release candidates in the dev repo
+# ---------------------------------------------------------------------------
+
+def s3_page(keys, token=None):
+    """A ListObjectsV2 page as S3 writes it, namespace and all."""
+    contents = "".join(f"<Contents><Key>{k}</Key><Size>1</Size></Contents>" for k in keys)
+    more = (f"<NextContinuationToken>{token}</NextContinuationToken><IsTruncated>true</IsTruncated>"
+            if token else "<IsTruncated>false</IsTruncated>")
+    return ('<?xml version="1.0" encoding="UTF-8"?>'
+            '<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">'
+            f"<Name>falco-distribution</Name>{more}{contents}</ListBucketResult>").encode()
+
+
+DEB = "packages/deb-dev/stable/"
+RPM = "packages/rpm-dev/"
+
+
+def test_list_page_url_encodes_the_continuation_token():
+    # Real tokens look like this. A raw '+' reaches S3 as a space.
+    url = qualify.list_page_url(qualify.DEV_INDEX, DEB, "1+hGB/bR==")
+    assert "continuation-token=1%2BhGB%2FbR%3D%3D" in url
+    assert "list-type=2" in url and "prefix=packages%2Fdeb-dev%2Fstable%2F" in url
+    assert "continuation-token" not in qualify.list_page_url(qualify.DEV_INDEX, DEB)
+
+
+def test_list_keys_follows_every_page():
+    pages = {None: s3_page([DEB + "falco-0.45.0-rc1-x86_64.deb"], token="t+1"),
+             "t+1": s3_page([DEB + "falco-0.45.1-rc1-x86_64.deb"])}
+    seen = []
+
+    def fetch(url):
+        token = dict(parse_qsl(url.split("?", 1)[1])).get("continuation-token")
+        seen.append(token)
+        return pages[token]
+
+    keys = qualify.list_keys(qualify.DEV_INDEX, DEB, fetch)
+    assert seen == [None, "t+1"]
+    assert keys == [DEB + "falco-0.45.0-rc1-x86_64.deb", DEB + "falco-0.45.1-rc1-x86_64.deb"]
+
+
+def test_last_page_ends_the_listing_even_if_a_token_is_present():
+    xml = s3_page(["a"]).replace(b"<IsTruncated>false</IsTruncated>",
+                                 b"<NextContinuationToken>x</NextContinuationToken>"
+                                 b"<IsTruncated>false</IsTruncated>")
+    assert qualify.parse_list_page(xml) == (["a"], None)
+
+
+def test_rc_versions_skips_dev_builds_other_arches_and_signatures():
+    keys = [DEB + "falco-0.45.1-rc1-x86_64.deb",
+            DEB + "falco-0.45.1-rc1-x86_64.deb.asc",
+            DEB + "falco-0.45.1-rc1-aarch64.deb",
+            DEB + "falco-0.46.0-44+066991c-x86_64.deb",
+            DEB + "falco-0.45.0-x86_64.deb",
+            RPM + "falco-0.45.0-rc4-x86_64.rpm"]
+    assert qualify.rc_versions(keys, "deb") == {"0.45.1-rc1"}
+    assert qualify.rc_versions(keys, "rpm") == {"0.45.0-rc4"}
+
+
+def test_discover_new_offers_only_candidates_past_the_newest_qualified_version():
+    available = {"0.39.0-rc1", "0.45.0-rc4", "0.45.1-rc1", "0.45.1-rc2", "0.46.0-rc1"}
+    # 0.45.1-rc1 is done; rc2 and the next minor's rc1 are news, in order.
+    assert qualify.discover_new(available, {"0.45.0", "0.45.1-rc1"}) == ["0.45.1-rc2", "0.46.0-rc1"]
+    # An rc of a release that already shipped GA is history.
+    assert qualify.discover_new({"0.45.0-rc4"}, {"0.45.0"}) == []
+    assert qualify.discover_new(available, {"0.46.0-rc1"}) == []
+
+
+def test_discover_new_on_a_fresh_workspace_starts_one_grid():
+    assert qualify.discover_new({"0.39.0-rc1", "0.45.0-rc4", "0.45.1-rc1"}, set()) == ["0.45.1-rc1"]
+    assert qualify.discover_new(set(), set()) == []
+
+
+def test_complete_versions_needs_every_planned_cell(tmp_path):
+    names = ["ubuntu-20.04--5.4--fresh-auto", "ubuntu-20.04--5.4--upgrade"]
+    for version, cells in [("0.45.0", names), ("0.45.1-rc2", names[:1]), ("0.45.1-rc1", names)]:
+        (tmp_path / version).mkdir()
+        for n in cells:
+            (tmp_path / version / f"{n}.json").write_text("{}")
+    (tmp_path / "matrix.json").write_text("{}")
+    assert qualify.complete_versions(tmp_path, names) == {"0.45.0", "0.45.1-rc1"}
+    assert qualify.complete_versions(tmp_path / "missing", names) == set()
+
+
+def test_half_run_candidate_is_offered_again():
+    # rc2 was killed midway: rc1 is the newest complete grid, so rc2 comes back
+    # and --resume finishes it.
+    assert qualify.discover_new({"0.45.1-rc1", "0.45.1-rc2"}, {"0.45.1-rc1"}) == ["0.45.1-rc2"]
+
+
+def test_discover_needs_both_formats_published(tmp_path):
+    qual = {"targets": ["ubuntu-20.04"], "scenarios": [FRESH_AUTO]}
+    listing = {DEB: [DEB + "falco-0.45.1-rc1-x86_64.deb", DEB + "falco-0.45.1-rc2-x86_64.deb"],
+               RPM: [RPM + "falco-0.45.1-rc1-x86_64.rpm"]}          # rc2 rpm not uploaded yet
+
+    def fetch(url):
+        prefix = DEB if "deb-dev" in url else RPM
+        return s3_page(listing[prefix])
+
+    (tmp_path / "0.45.0").mkdir()
+    (tmp_path / "0.45.0" / "ubuntu-20.04--5.4--fresh-auto.json").write_text("{}")
+    assert qualify.discover(qual, {"ubuntu-20.04": distro()}, root=tmp_path, fetch=fetch) == ["0.45.1-rc1"]
+
+
+# ---------------------------------------------------------------------------
+# --gate: new red fails the build, known red does not
+# ---------------------------------------------------------------------------
+
+def gcell(version, status, distro_name="ubuntu-20.04", kernel="5.4", scenario="fresh-auto"):
+    return {"version": version, "distro": distro_name, "kernel": kernel, "scenario": scenario,
+            "status": status, "reason": f"{status} reason"}
+
+
+def test_known_red_rows_do_not_fail_the_gate():
+    # falco#3994: red on 20.04 in 0.45.0 and still red in 0.45.1-rc1.
+    cells = [gcell("0.45.0", "fail"), gcell("0.45.1-rc1", "fail"),
+             gcell("0.45.0", "pass", kernel="5.15-hwe"), gcell("0.45.1-rc1", "pass", kernel="5.15-hwe")]
+    g = qualify.gate(cells, "0.45.1-rc1")
+    assert g["new"] == [] and [r["cell"] for r in g["known"]] == ["ubuntu-20.04--5.4--fresh-auto"]
+    assert g["known"][0]["baseline_version"] == "0.45.0" and g["cells"] == 2
+
+
+def test_green_row_turning_red_fails_the_gate():
+    cells = [gcell("0.45.0", "pass", "debian-12", "6.1"), gcell("0.45.1-rc1", "fail", "debian-12", "6.1")]
+    g = qualify.gate(cells, "0.45.1-rc1")
+    assert [(r["cell"], r["baseline_status"]) for r in g["new"]] == [("debian-12--6.1--fresh-auto", "pass")]
+
+
+def test_harness_error_is_red_both_ways():
+    # error before, fail now: still red, already known. pass before, error now: new.
+    cells = [gcell("0.45.0", "error"), gcell("0.45.1-rc1", "fail"),
+             gcell("0.45.0", "pass", scenario="upgrade"), gcell("0.45.1-rc1", "error", scenario="upgrade")]
+    g = qualify.gate(cells, "0.45.1-rc1")
+    assert [r["cell"] for r in g["known"]] == ["ubuntu-20.04--5.4--fresh-auto"]
+    assert [r["cell"] for r in g["new"]] == ["ubuntu-20.04--5.4--upgrade"]
+
+
+def test_red_row_with_no_earlier_result_is_new():
+    g = qualify.gate([gcell("0.45.1-rc1", "fail", "fedora-45", "6.20")], "0.45.1-rc1")
+    assert g["new"][0]["baseline_version"] is None
+
+
+def test_blocked_or_unsupported_before_is_not_a_known_failure():
+    cells = [gcell("0.45.0", "blocked", scenario="upgrade"), gcell("0.45.1-rc1", "fail", scenario="upgrade"),
+             gcell("0.45.0", "unsupported", scenario="fresh-modern_ebpf"),
+             gcell("0.45.1-rc1", "fail", scenario="fresh-modern_ebpf")]
+    assert len(qualify.gate(cells, "0.45.1-rc1")["new"]) == 2
+
+
+def test_baseline_is_per_cell_newest_earlier_version_that_ran_it():
+    # 0.45.0-rc4 only ran 20.04 fresh-auto (green). 0.45.0 ran it red. For
+    # 0.45.1-rc1 the baseline is 0.45.0, not rc4; a row rc4 never ran falls
+    # back to whatever earlier version did.
+    cells = [gcell("0.45.0-rc4", "pass"), gcell("0.45.0", "fail"), gcell("0.45.1-rc1", "fail"),
+             gcell("0.44.1", "fail", scenario="upgrade"), gcell("0.45.1-rc1", "fail", scenario="upgrade"),
+             gcell("0.45.2", "pass", scenario="upgrade")]       # later versions are not a baseline
+    g = qualify.gate(cells, "0.45.1-rc1")
+    assert g["new"] == []
+    assert {r["cell"]: r["baseline_version"] for r in g["known"]} == {
+        "ubuntu-20.04--5.4--fresh-auto": "0.45.0", "ubuntu-20.04--5.4--upgrade": "0.44.1"}
+
+
+def test_red_row_turning_green_is_reported_as_fixed():
+    g = qualify.gate([gcell("0.45.0", "fail"), gcell("0.45.1-rc1", "pass")], "0.45.1-rc1")
+    assert g["new"] == g["known"] == [] and g["fixed"][0]["baseline_status"] == "fail"
+    assert "1 fixed" in qualify.gate_text(g)
+
+
+def test_gate_reads_the_shipped_matrix_shape(tmp_path):
+    # build_matrix's cells are what --gate feeds gate(); keep the two in step.
+    rec = record(version="0.45.0", pkg_exit=100, pkg_state="install ok half-configured",
+                 started=False, kmod_loaded=False)
+    new = record(version="0.45.1-rc1", pkg_version="0.45.1-rc1", pkg_exit=100,
+                 pkg_state="install ok half-configured", started=False, kmod_loaded=False)
+    for r in (rec, new):
+        (tmp_path / r["version"]).mkdir()
+        (tmp_path / r["version"] / f"{r['cell']}.json").write_text(json.dumps(r))
+    (tmp_path / "0.45.0" / "gate.json").write_text(json.dumps({"version": "0.45.0", "new": []}))
+    g = qualify.gate(qualify.build_matrix(tmp_path)["cells"], "0.45.1-rc1")
+    assert (len(g["new"]), len(g["known"])) == (0, 1)

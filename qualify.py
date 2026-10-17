@@ -29,6 +29,8 @@ USAGE
     ./qualify.py --version 0.45.1-rc1 --target ubuntu-20.04 --scenario fresh-auto
     ./qualify.py --resume                          # skip cells that already have a result
     ./qualify.py --matrix-only                     # rebuild matrix.json from cell results
+    ./qualify.py --discover                        # release candidates not yet qualified
+    ./qualify.py --gate 0.45.1-rc1                 # exit 1 only on red cells that are new
 
 At most --max-vms VMs run at once (default 4), counting VMs this script did
 not start: hardac2's RAM is shared with other work.
@@ -39,6 +41,16 @@ OUTPUT
     results/qualification/<version>/evidence/<cell>/     evidence bundle
     results/qualification/<version>/logs/<cell>.log      the run's console
     results/qualification/matrix.json                    every cell, for a dashboard
+    results/qualification/<version>/gate.json            new vs known red cells (--gate)
+
+WATCHING PRE-RELEASES
+---------------------
+Jenkinsfile.qualify runs this nightly: --discover lists the dev repo and
+prints each release candidate that is newer than the newest fully qualified
+version, the job qualifies each one, and --gate turns the grid into a build
+result. A red cell that was already red for the same distro, kernel and
+scenario in an earlier version is known (falco#3994 on 18.04/20.04) and does
+not fail the build; one that was green, or never ran, does.
 """
 
 from __future__ import annotations
@@ -46,11 +58,13 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import time
 import urllib.parse
 import urllib.request
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -495,6 +509,154 @@ def write_matrix() -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Watching the dev repo for release candidates
+# ---------------------------------------------------------------------------
+# download.falco.org fronts this bucket, and the bucket answers ListObjectsV2.
+DEV_INDEX = "https://falco-distribution.s3-eu-west-1.amazonaws.com/"
+DEV_PREFIXES = {"deb": "packages/deb-dev/stable/", "rpm": "packages/rpm-dev/"}
+RC_PACKAGE = re.compile(r"(?:^|/)falco-(\d+\.\d+\.\d+-rc\d+)-x86_64\.(deb|rpm)$")
+_S3 = "{http://s3.amazonaws.com/doc/2006-03-01/}"
+
+
+def list_page_url(index: str, prefix: str, token: str | None = None) -> str:
+    """
+    One ListObjectsV2 page. The continuation token is opaque base64 and
+    carries '+', '/' and '=', so it must be encoded: a raw '+' reaches S3 as
+    a space and the next page comes back as an error.
+    """
+    query = {"list-type": "2", "prefix": prefix}
+    if token:
+        query["continuation-token"] = token
+    return f"{index}?{urllib.parse.urlencode(query)}"
+
+
+def parse_list_page(xml_text: str | bytes) -> tuple[list[str], str | None]:
+    """(keys on this page, token for the next page or None when this is the last)."""
+    root = ET.fromstring(xml_text)
+    keys = [k.text for k in root.iter(f"{_S3}Key") if k.text]
+    truncated = root.findtext(f"{_S3}IsTruncated") == "true"
+    return keys, (root.findtext(f"{_S3}NextContinuationToken") if truncated else None)
+
+
+def _fetch(url: str) -> bytes:
+    with urllib.request.urlopen(url, timeout=60) as resp:
+        return resp.read()
+
+
+def list_keys(index: str, prefix: str, fetch=_fetch) -> list[str]:
+    """Every key under prefix. One page holds 1000; deb-dev alone is past 1100."""
+    keys: list[str] = []
+    token = None
+    for _ in range(1000):                   # a token that never ends is a bug, not a listing
+        page, token = parse_list_page(fetch(list_page_url(index, prefix, token)))
+        keys += page
+        if not token:
+            return keys
+    raise RuntimeError(f"{prefix}: listing never ended")
+
+
+def rc_versions(keys: list[str], fmt: str) -> set[str]:
+    """Release candidates among the keys. Per-commit builds (0.46.0-44+066991c),
+    aarch64 and .asc signatures are not candidates."""
+    found = set()
+    for key in keys:
+        m = RC_PACKAGE.search(key)
+        if m and m.group(2) == fmt:
+            found.add(m.group(1))
+    return found
+
+
+def complete_versions(root: Path, cell_names: list[str]) -> set[str]:
+    """Versions with a result, of any status, for every planned cell. A run
+    killed halfway leaves a partial grid, which --discover offers again so
+    --resume can finish it."""
+    if not root.is_dir():
+        return set()
+    return {d.name for d in root.iterdir()
+            if d.is_dir() and all((d / f"{n}.json").exists() for n in cell_names)}
+
+
+def discover_new(available: set[str], complete: set[str]) -> list[str]:
+    """
+    Release candidates to qualify, oldest first: those newer than the newest
+    fully qualified version. Older candidates are history, not news: the
+    dev repo still serves 0.39.0-rc1, and the grid is about what ships next.
+    With nothing qualified yet, only the newest candidate, so a fresh
+    workspace starts one grid, not twenty.
+    """
+    if not available:
+        return []
+    ordered = sorted(available, key=version_key)
+    if not complete:
+        return ordered[-1:]
+    floor = version_key(max(complete, key=version_key))
+    return [v for v in ordered if version_key(v) > floor]
+
+
+def discover(qual: dict, distros: dict[str, Distro], index: str = DEV_INDEX,
+             root: Path = QUAL_RESULTS, fetch=_fetch) -> list[str]:
+    """New release candidates, published in both formats. The .deb and .rpm
+    are uploaded separately; qualifying in the gap between them would stop
+    on a missing package URL before a VM boots."""
+    available = (rc_versions(list_keys(index, DEV_PREFIXES["deb"], fetch), "deb")
+                 & rc_versions(list_keys(index, DEV_PREFIXES["rpm"], fetch), "rpm"))
+    names = [cell_name(distros[t], s.id) for t in qual["targets"] for s in qual["scenarios"]]
+    return discover_new(available, complete_versions(root, names))
+
+
+# ---------------------------------------------------------------------------
+# Gate: fail on red that is new, not on red that is known
+# ---------------------------------------------------------------------------
+RED = ("fail", "error")
+
+
+def gate(cells: list[dict], version: str) -> dict:
+    """
+    Compare each cell of version with the same distro, kernel and scenario
+    in the newest earlier version that ran it. Per cell, not per grid: an
+    earlier grid that only ran a few rows (0.45.0-rc4) is still the baseline
+    for those rows, and the rows it skipped fall back further.
+
+        new      red now; green, blocked, unsupported or absent before
+        known    red now and red before: already reported, keeps the build green
+        fixed    red before, not red now
+    """
+    def key(c: dict) -> tuple:
+        return (c["distro"], c["kernel"], c["scenario"])
+
+    vk = version_key(version)
+    baseline: dict[tuple, dict] = {}
+    for c in sorted((c for c in cells if version_key(c["version"]) < vk),
+                    key=lambda c: version_key(c["version"])):
+        baseline[key(c)] = c                # newest earlier version wins
+    out = {"version": version, "new": [], "known": [], "fixed": []}
+    for c in sorted((c for c in cells if c["version"] == version), key=key):
+        before = baseline.get(key(c))
+        row = {"cell": f"{c['distro']}--{c['kernel']}--{c['scenario']}",
+               "status": c["status"], "reason": c["reason"],
+               "baseline_version": before["version"] if before else None,
+               "baseline_status": before["status"] if before else None}
+        if c["status"] in RED:
+            out["known" if before and before["status"] in RED else "new"].append(row)
+        elif before and before["status"] in RED:
+            out["fixed"].append(row)
+    out["cells"] = sum(1 for c in cells if c["version"] == version)
+    return out
+
+
+def gate_text(result: dict) -> str:
+    lines = [f"gate {result['version']}: {result['cells']} cells, {len(result['new'])} new red, "
+             f"{len(result['known'])} known red, {len(result['fixed'])} fixed"]
+    for label in ("new", "known", "fixed"):
+        for r in result[label]:
+            was = (f"{r['baseline_status']} in {r['baseline_version']}" if r["baseline_version"]
+                   else "no earlier result")
+            lines.append(f"  {label.upper():<6} {r['cell']:<44} {r['status']:<6} (was {was})"
+                         + (f"  {r['reason'][:100]}" if label != "fixed" else ""))
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 def main() -> int:
@@ -514,6 +676,11 @@ def main() -> int:
     parser.add_argument("--rejudge", action="store_true",
                         help="recompute every stored cell's verdict from its observations, "
                              "then rebuild matrix.json (no VMs)")
+    parser.add_argument("--discover", action="store_true",
+                        help="print release candidates in the dev repo not yet qualified, one per line")
+    parser.add_argument("--gate", action="append", metavar="VERSION",
+                        help="exit 1 if VERSION has red cells that were not red in an earlier "
+                             "version; writes <version>/gate.json (no VMs)")
     parser.add_argument("--one", nargs=3, metavar=("VERSION", "TARGET", "SCENARIO"),
                         help=argparse.SUPPRESS)
     args = parser.parse_args()
@@ -531,10 +698,28 @@ def main() -> int:
     if args.matrix_only or args.rejudge:
         print(grid_text(write_matrix()))
         return 0
+    if args.gate:
+        cells = build_matrix()["cells"]
+        regressed = False
+        for version in args.gate:
+            if not any(c["version"] == version for c in cells):
+                log(f"no results for {version} under {QUAL_RESULTS}", "ERROR")
+                return 2
+            result = gate(cells, version)
+            (QUAL_RESULTS / version / "gate.json").write_text(json.dumps(result, indent=2))
+            print(gate_text(result))
+            regressed |= bool(result["new"])
+        return 1 if regressed else 0
 
     qual = load_qualification(args.qualification)
     distros_list, checks = provision.load_matrix(args.matrix)
     distros = {d.name: d for d in distros_list}
+
+    if args.discover:
+        # stdout carries only the versions, so a pipeline can read it as a list.
+        for version in discover(qual, distros):
+            print(version)
+        return 0
 
     if args.one:
         version, target, scenario = args.one

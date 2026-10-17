@@ -237,6 +237,24 @@ results/qualification/matrix.json                   every cell: status, checks, 
 
 The first run (0.45.0, 0.45.1-rc1, 0.45.0-rc4) and what it found: [`QUALIFICATION.md`](QUALIFICATION.md).
 
+### Every release candidate, automatically
+
+[`Jenkinsfile.qualify`](Jenkinsfile.qualify) is its own Jenkins job, nightly at `H 5`,
+clear of the kernel matrix. It lists the dev repo and qualifies each release candidate
+newer than the newest fully qualified version, published as both `.deb` and `.rpm`:
+
+```bash
+python3 qualify.py --discover                    # new RCs, one per line (S3 ListObjectsV2, paginated)
+python3 qualify.py --gate 0.45.1-rc1             # exit 1 only on red cells that are new
+```
+
+The gate compares each cell with the same distro, kernel and scenario in the newest earlier
+version that ran it. Red before and red now is `known` and keeps the build green (#3994 on
+18.04/20.04 would otherwise fail every night); green, blocked, unsupported or never run
+before and red now is `new` and fails it; red before and green now is `fixed`. The verdict
+is written to `results/qualification/<version>/gate.json` and archived with the grid.
+Build with `VERSIONS=0.45.1-rc1` to re-run a named version.
+
 ---
 
 ## Layout
@@ -257,6 +275,7 @@ report.py            results.json -> self-contained HTML; archives every run,
 push_metrics.py      results.json -> Prometheus Pushgateway
 xray_import.py       JUnit -> Jira/Xray, one environment per kernel
 Jenkinsfile          preflight -> lint -> parallel matrix -> publish
+Jenkinsfile.qualify  nightly: discover new Falco RCs -> qualify -> gate on new red cells
 observability/       docker compose: Prometheus, Grafana, Pushgateway, nginx
 ```
 

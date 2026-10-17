@@ -1,0 +1,208 @@
+// ===========================================================================
+//  Jenkinsfile.qualify -- Falco package qualification, every release candidate
+// ===========================================================================
+//
+//  A separate job from Jenkinsfile (the nightly kernel matrix), so neither
+//  one's schedule, parameters or red builds touch the other.
+//
+//  WHY
+//  ---
+//  falcosecurity/falco#3994 broke fresh installs on kernels without modern
+//  eBPF. It was visible in 0.45.0-rc3 and rc4, days before GA, and is still
+//  in 0.45.1-rc1. Nobody installed those release candidates through the
+//  package manager on an old kernel. This job does, every night a new one
+//  appears in the dev repo:
+//
+//     Discover     list the dev repo, keep RCs newer than the newest
+//                  fully qualified version (qualify.py --discover)
+//     Unit tests   the code that decides a cell's colour, before any VM
+//     Qualify      qualify.py --version <rc>: every distro/kernel x scenario
+//                  cell on a real VM, at most 4 VMs on the host at once
+//     Gate         qualify.py --gate <rc>: red only for cells that are red
+//                  now and were not red in an earlier version
+//
+//  The gate is what keeps this useful. 13 cells of 0.45.1-rc1 are red
+//  (#3994 on 18.04/20.04, centos-7's glibc, the falcoctl kmod headers bug).
+//  Failing on those every night would teach everyone to ignore the job.
+//  Failing on a cell that was green last version is the signal.
+//
+//  HISTORY LIVES IN THE WORKSPACE
+//  ------------------------------
+//  Discovery and the gate both read earlier grids from
+//  results/qualification/, which is gitignored and persists in the
+//  workspace between builds. A workspace with no grids yet copies them once
+//  from KM_QUAL_SEED (the hand-run grids from the commit that added
+//  qualify.py). Without a seed, the first build qualifies only the newest RC
+//  and every red cell in it counts as new.
+// ===========================================================================
+
+// The versions this build qualifies, decided in Discover. A binding, not a
+// def, so every stage and post block sees the same list.
+toQualify = []
+
+pipeline {
+    agent any
+
+    options {
+        // One grid is ~40 min at 4 VMs; two new RCs in one night, or VMs
+        // from other work holding slots, can double that.
+        timeout(time: 6, unit: 'HOURS')
+        buildDiscarder(logRotator(numToKeepStr: '60'))
+        disableConcurrentBuilds()
+    }
+
+    parameters {
+        string(
+            name: 'VERSIONS',
+            defaultValue: '',
+            description: 'Space-separated versions to qualify, e.g. "0.45.1-rc1". Empty: discover new release candidates in the dev repo. A listed version is re-run from scratch.'
+        )
+    }
+
+    triggers {
+        // Clear of the kernel matrix job (H 2, 60 min cap): its Preflight and
+        // cleanup reap every km-* domain on the host, which would kill this
+        // job's VMs mid-install.
+        cron('H 5 * * *')
+    }
+
+    environment {
+        KMATRIX_ROOT        = "${env.HOME}/kernel-matrix-lab"
+        LIBVIRT_DEFAULT_URI = 'qemu:///system'
+        KM_QUAL_SEED        = '/home/mcastill/kernel-matrix/results/qualification'
+        PYTHONUNBUFFERED    = '1'
+    }
+
+    stages {
+        stage('Preflight') {
+            steps {
+                sh '''
+                    set -eu
+                    test -e /dev/kvm || { echo "ERROR: /dev/kvm missing"; exit 1; }
+                    virsh list --all >/dev/null || { echo "ERROR: cannot talk to libvirt"; exit 1; }
+                    df -h "${KMATRIX_ROOT%/*}"
+
+                    # Only domains whose owning process is gone. qualify.py
+                    # counts every running VM against its cap and shares the
+                    # host with other work, so a blanket km-* reap here would
+                    # kill VMs this job does not own.
+                    for dom in $(virsh list --all --name | grep '^km-' || true); do
+                        pid=$(echo "$dom" | awk -F- '{print $(NF-1)}')
+                        [ -d "/proc/$pid" ] && continue
+                        echo "reaping orphaned domain $dom (pid $pid is gone)"
+                        virsh destroy "$dom" 2>/dev/null || true
+                        virsh undefine "$dom" --nvram 2>/dev/null || true
+                        rm -f "${KMATRIX_ROOT}/overlays/${dom}.qcow2" "${KMATRIX_ROOT}/seeds/${dom}"-*
+                    done
+
+                    mkdir -p results/qualification
+                    if ! ls -d results/qualification/*/ >/dev/null 2>&1 && [ -d "$KM_QUAL_SEED" ]; then
+                        echo "no grids in the workspace yet: seeding from $KM_QUAL_SEED"
+                        cp -r "$KM_QUAL_SEED"/. results/qualification/
+                        rm -f results/qualification/*/gate.json
+                    fi
+                    ls results/qualification/
+                '''
+            }
+        }
+
+        stage('Unit tests') {
+            steps {
+                sh '''
+                    set -eu
+                    [ -d .venv ] || python3 -m venv --system-site-packages .venv
+                    ./.venv/bin/python -m pip install -q --disable-pip-version-check pytest
+                    ./.venv/bin/python -m pytest tests/ -q --junitxml=results/qualify-unit-tests.xml
+                '''
+            }
+            post {
+                always {
+                    junit testResults: 'results/qualify-unit-tests.xml', allowEmptyResults: true
+                }
+            }
+        }
+
+        stage('Discover') {
+            steps {
+                script {
+                    if (params.VERSIONS?.trim()) {
+                        toQualify = params.VERSIONS.tokenize()
+                        echo "asked for: ${toQualify.join(' ')}"
+                    } else {
+                        def out = sh(script: 'python3 qualify.py --discover', returnStdout: true).trim()
+                        toQualify = out.tokenize()
+                        echo(toQualify ? "new release candidates: ${toQualify.join(' ')}"
+                                       : 'no new release candidates in the dev repo')
+                    }
+                    currentBuild.description = toQualify ? toQualify.join(' ') : 'nothing new'
+                }
+            }
+        }
+
+        stage('Qualify') {
+            when { expression { !toQualify.isEmpty() } }
+            steps {
+                script {
+                    for (v in toQualify) {
+                        // A discovered version may be a grid a killed build
+                        // left half done: --resume finishes it. A version a
+                        // human named is re-run whole.
+                        def resume = params.VERSIONS?.trim() ? '' : '--resume'
+                        // Exit 1 means red cells somewhere, which the Gate
+                        // judges. Exit 2 is a missing package URL and any
+                        // other code is the harness: those stop the build.
+                        def rc = sh(script: "python3 qualify.py --version '${v}' ${resume}",
+                                    returnStatus: true)
+                        if (rc > 1) {
+                            error("qualify.py --version ${v} exited ${rc}")
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Gate') {
+            when { expression { !toQualify.isEmpty() } }
+            steps {
+                sh 'python3 qualify.py --matrix-only'
+                script {
+                    def gates = toQualify.collect { "--gate '${it}'" }.join(' ')
+                    def rc = sh(script: "python3 qualify.py ${gates}", returnStatus: true)
+                    if (rc == 1) {
+                        error('new red cells: a cell that was not red in an earlier version is red now (see above)')
+                    } else if (rc != 0) {
+                        error("qualify.py --gate exited ${rc}")
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            script {
+                // This build's grids only. The workspace keeps every
+                // version as history; archiving all of it every night would
+                // copy the same evidence bundles again and again.
+                def patterns = toQualify.collect { "results/qualification/${it}/**" }
+                patterns << 'results/qualification/matrix.json'
+                archiveArtifacts artifacts: patterns.join(', '), allowEmptyArchive: true
+            }
+        }
+        cleanup {
+            // qualify.py's children destroy their own VMs in a finally block;
+            // a build killed by its timeout never reaches it. Same rule as
+            // Preflight: only domains whose process is gone.
+            sh '''
+                for dom in $(virsh list --all --name 2>/dev/null | grep '^km-' || true); do
+                    pid=$(echo "$dom" | awk -F- '{print $(NF-1)}')
+                    [ -d "/proc/$pid" ] && continue
+                    echo "post-build cleanup: $dom"
+                    virsh destroy "$dom" 2>/dev/null || true
+                    virsh undefine "$dom" --nvram 2>/dev/null || true
+                    rm -f "${KMATRIX_ROOT}/overlays/${dom}.qcow2" "${KMATRIX_ROOT}/seeds/${dom}"-*
+                done
+            '''
+        }
+    }
+}
