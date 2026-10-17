@@ -47,6 +47,7 @@ cap system.txt "nproc; free -m"
 # --- kernel capabilities a sensor depends on ----------------------------------
 cap kernel.txt "ls -l /sys/kernel/btf/vmlinux"
 cap kernel.txt "cat /sys/kernel/security/lsm"
+cap kernel.txt "cat /sys/kernel/security/lockdown; mokutil --sb-state 2>/dev/null || ls /sys/firmware/efi 2>/dev/null | head -1 || echo 'BIOS boot (no EFI)'"
 cap kernel.txt "sysctl kernel.unprivileged_bpf_disabled net.core.bpf_jit_enable kernel.perf_event_paranoid"
 cap kernel.txt "grep -E '^CONFIG_(BPF|BPF_SYSCALL|BPF_JIT|DEBUG_INFO_BTF|HAVE_EBPF_JIT|BPF_EVENTS|KPROBES|TRACEPOINTS|FTRACE_SYSCALLS)=' /boot/config-\$(uname -r)"
 cap kernel.txt "lsmod | grep -iE 'falco|scap' || echo 'no falco kernel module loaded'"
@@ -65,6 +66,16 @@ else
     cap scripts.txt "rpm -q --scripts falco"
 fi
 
+# Qualification runs (falco_probe.sh strict mode) keep the package manager's
+# complete output, maintainer scripts included: the postinst's own words are
+# the first thing to read when a package lands half-configured.
+if [ -f /var/log/km-pkg-install.log ]; then
+    cap install.log "cat /var/log/km-pkg-install.log"
+fi
+if [ -f /var/log/km-build-prereqs.log ]; then
+    cap prereqs.log "cat /var/log/km-build-prereqs.log"
+fi
+
 # --- the sensor itself ---------------------------------------------------------
 cap falco.txt "falco --version"
 cap falco.txt "systemctl list-unit-files 'falco*'"
@@ -76,6 +87,10 @@ cap falco.txt "for so in /usr/share/falco/plugins/*.so; do echo \"== \$so\"; ldd
 cap falco.txt "grep -vE '^\s*(#|$)' /etc/falco/falco.yaml | head -n 80"
 cap falco.txt "tail -n 15 /etc/falco/falco.yaml"
 cap falco.txt "ls -l /etc/falco /etc/falco/rules.d /etc/falco/config.d"
+# Which driver types falcoctl is allowed to pick, and what it picks. The
+# printenv is guarded: on a host with no config it would create one.
+cap falco.txt "cat /etc/falcoctl/falcoctl.yaml"
+cap falco.txt "test -f /etc/falcoctl/falcoctl.yaml && falcoctl driver printenv"
 cap falco.txt "cat /etc/falco/falco_rules.local.yaml /etc/falco/rules.d/*.yaml"
 # systemctl cat prints each unit WITH its drop-ins, which is where a changed
 # limit or ExecStart hides.

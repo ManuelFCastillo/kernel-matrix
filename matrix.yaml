@@ -41,6 +41,10 @@
 #                build and the full tier nightly. This is the cost-control
 #                lever: real VMs are expensive, so you do not run all of them
 #                on every commit.
+#
+#    base / os / kernel_variant / kernel_packages
+#                optional, for a kernel variant: the same release booted on
+#                another kernel. See ubuntu-20.04-hwe below.
 # ============================================================================
 
 defaults:
@@ -150,6 +154,29 @@ distros:
     ssh_user: ubuntu
     expect_kernel: "5.4"
     tier: legacy
+
+  # 5.15 on the SAME release -- Ubuntu 20.04's HWE kernel. Identical
+  # userspace, glibc and package manager to the row above; only the kernel
+  # moves, so a result that differs between the two follows the kernel, not
+  # the distro. No cloud image ships it: provision.py installs
+  # kernel_packages in the VM and reboots into it (install_kernel_variant),
+  # then kernel_version_matches_expectation proves the reboot took.
+  #
+  #   base   reuse ubuntu-20.04's cached image instead of downloading it again
+  #   os     the release this is a variant of; reports group under it
+  #
+  # tier: variant keeps it out of the Jenkins axis (which mirrors tiers by
+  # hand) until it has earned a nightly slot; qualify.py runs it.
+  - name: ubuntu-20.04-hwe
+    image_url: https://cloud-images.ubuntu.com/releases/20.04/release/ubuntu-20.04-server-cloudimg-amd64.img
+    base: ubuntu-20.04
+    os: ubuntu-20.04
+    kernel_variant: hwe
+    kernel_packages: [linux-generic-hwe-20.04]
+    ssh_user: ubuntu
+    expect_kernel: "5.15"
+    tier: variant
+    boot_timeout_sec: 420    # the reboot into the new kernel counts against it
 
   # 5.10 -- exactly on the boundary. The most informative single data point
   # in the whole matrix.

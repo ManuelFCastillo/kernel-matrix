@@ -44,8 +44,10 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import itertools
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -145,12 +147,28 @@ class Distro:
     vcpus: int = 2
     boot_timeout_sec: int = 300
     firmware: str = "bios"          # "bios" or "uefi"
+    # Kernel variants: the same release on a different kernel, e.g. Ubuntu
+    # 20.04 on its HWE kernel. See install_kernel_variant and matrix.yaml.
+    base: str = ""                  # share this entry's cached image
+    os: str = ""                    # the release, when name is a variant of it
+    kernel_variant: str = ""        # "hwe", ...; empty for the image's own kernel
+    kernel_packages: list[str] = field(default_factory=list)
 
     @property
     def base_image(self) -> Path:
         # Name the cached file after the distro, not the URL, so a changed URL
-        # for the same distro replaces rather than accumulates.
-        return BASE_IMAGES / f"{self.name}.qcow2"
+        # for the same distro replaces rather than accumulates. A variant
+        # names its base, so the same image is not downloaded twice.
+        return BASE_IMAGES / f"{self.base or self.name}.qcow2"
+
+    @property
+    def os_name(self) -> str:
+        return self.os or self.name
+
+    @property
+    def kernel_label(self) -> str:
+        """'5.4' for the image's kernel, '5.15-hwe' for a variant: stable across runs."""
+        return f"{self.expect_kernel}-{self.kernel_variant}" if self.kernel_variant else self.expect_kernel
 
 
 @dataclass
@@ -172,6 +190,7 @@ class RunResult:
     falco: dict | None = None      # characterisation from falco_probe.sh
     fault: dict | None = None      # injected fault and whether it took effect, see faults.yaml
     error: str | None = None       # set when the VM never came up at all
+    prereqs: str = ""              # build_prereqs.sh verdict, when it ran
 
     @property
     def failed(self) -> int:
@@ -504,6 +523,118 @@ def destroy_vm(vm_name: str, overlay: Path, seed: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Kernel variants: install another kernel in the guest and boot into it
+# ---------------------------------------------------------------------------
+# Ubuntu 20.04 ships 5.4 and offers 5.15 as its HWE kernel. Running the same
+# release on both is how a matrix tells "fails on this kernel" from "fails on
+# this distro": the userspace, glibc and package manager stay identical and
+# only the kernel moves. No cloud image ships the HWE kernel preinstalled, so
+# it is installed in the VM and the VM rebooted into it.
+# ---------------------------------------------------------------------------
+def kernel_install_command(distro: Distro) -> str:
+    """The guest command that installs a variant's kernel packages."""
+    pkgs = " ".join(shlex.quote(p) for p in distro.kernel_packages)
+    if distro.os_name.startswith(("ubuntu", "debian")):
+        apt = "sudo env DEBIAN_FRONTEND=noninteractive apt-get"
+        # Headers come with the HWE metapackage, so fallback drivers can
+        # still build against the new kernel.
+        return f"{apt} update -qq && {apt} install -y -qq --no-install-recommends {pkgs}"
+    return f"sudo dnf install -y -q {pkgs}"
+
+
+BOOT_ID = "cat /proc/sys/kernel/random/boot_id"
+
+
+def reboot_guest(distro: Distro, ip: str, vm_name: str) -> tuple[str, str | None]:
+    """Reboot the guest and wait for the NEW boot. Returns (ip, error)."""
+    old_boot = ssh_exec(ip, distro.ssh_user, BOOT_ID).stdout.strip()
+    try:
+        # The connection usually drops mid-command; that is the reboot working.
+        ssh_exec(ip, distro.ssh_user, "sudo systemctl reboot", timeout=30)
+    except subprocess.TimeoutExpired:
+        pass
+
+    # A changed boot_id is the only proof of a reboot: SSH can still answer
+    # for a few seconds after the reboot command, from the OLD boot.
+    deadline = time.time() + distro.boot_timeout_sec
+    while time.time() < deadline:
+        time.sleep(5)
+        ip = get_vm_ip(vm_name, timeout=5) or ip
+        try:
+            now = ssh_exec(ip, distro.ssh_user, BOOT_ID, timeout=15)
+        except subprocess.TimeoutExpired:
+            continue
+        boot = now.stdout.strip()
+        if now.returncode == 0 and boot and boot != old_boot:
+            return ip, None
+    return ip, f"VM did not come back from the reboot within {distro.boot_timeout_sec}s"
+
+
+def install_kernel_variant(distro: Distro, ip: str, vm_name: str) -> tuple[str, str | None]:
+    """
+    Install the variant's kernel, reboot, and confirm the guest came back on
+    it. Returns (ip, error): the address can change across a reboot, and an
+    error means the cell is not testing the kernel it claims to.
+    """
+    log(f"kernel variant {distro.kernel_variant}: installing {' '.join(distro.kernel_packages)}")
+    proc = ssh_exec(ip, distro.ssh_user, kernel_install_command(distro), timeout=900)
+    if proc.returncode != 0:
+        tail = (proc.stdout + proc.stderr).strip().splitlines()[-5:]
+        return ip, f"kernel variant install failed: {' | '.join(tail)[:300]}"
+
+    log("kernel variant: rebooting into the new kernel")
+    ip, problem = reboot_guest(distro, ip, vm_name)
+    if problem:
+        return ip, f"kernel variant: {problem}"
+
+    running = ssh_exec(ip, distro.ssh_user, "uname -r").stdout.strip()
+    if not running.startswith(distro.expect_kernel):
+        return ip, (f"kernel variant {distro.kernel_variant}: rebooted into {running!r}, "
+                    f"expected {distro.expect_kernel}*")
+    log(f"kernel variant: running {running}")
+    return ip, None
+
+
+PREREQS_READY, PREREQS_REBOOT = 0, 10
+
+
+def ensure_build_prereqs(distro: Distro, ip: str, vm_name: str) -> tuple[str, str, str | None]:
+    """
+    Run build_prereqs.sh until the guest can build a kmod for its running
+    kernel, rebooting once if it had to move to the archive's current kernel.
+    Returns (ip, verdict line, error). An error means the cell cannot test a
+    kmod honestly, so it must read as a harness error, never as a package
+    failure.
+    """
+    script = Path(__file__).parent / "build_prereqs.sh"
+    up = subprocess.run(["scp", *SSH_OPTS, "-i", str(SSH_KEY), str(script),
+                         f"{distro.ssh_user}@{ip}:/tmp/build_prereqs.sh"],
+                        capture_output=True, text=True, timeout=60)
+    if up.returncode != 0:
+        return ip, "", f"build prerequisites: upload failed: {up.stderr.strip()[:200]}"
+    for attempt in (1, 2):
+        try:
+            proc = ssh_exec(ip, distro.ssh_user, "sudo bash /tmp/build_prereqs.sh", timeout=1200)
+        except subprocess.TimeoutExpired:
+            return ip, "", "build prerequisites: timed out"
+        lines = [l for l in (proc.stdout + proc.stderr).splitlines() if l.startswith("prereqs:")]
+        verdict = lines[-1] if lines else f"exit {proc.returncode}"
+        log(f"build prerequisites: {verdict}")
+        if proc.returncode == PREREQS_READY:
+            return ip, verdict, None
+        if proc.returncode != PREREQS_REBOOT or attempt == 2:
+            return ip, verdict, f"build prerequisites unavailable: {verdict}"
+        ip, problem = reboot_guest(distro, ip, vm_name)
+        if problem:
+            return ip, verdict, f"build prerequisites: {problem}"
+        # The script is in /tmp, which a reboot may clear.
+        subprocess.run(["scp", *SSH_OPTS, "-i", str(SSH_KEY), str(script),
+                        f"{distro.ssh_user}@{ip}:/tmp/build_prereqs.sh"],
+                       capture_output=True, text=True, timeout=60)
+    return ip, "", "build prerequisites: unreachable"
+
+
+# ---------------------------------------------------------------------------
 # The checks
 # ---------------------------------------------------------------------------
 def run_checks(distro: Distro, ip: str, checks: list[dict]) -> list[CheckResult]:
@@ -577,7 +708,8 @@ def run_checks(distro: Distro, ip: str, checks: list[dict]) -> list[CheckResult]
 # Falco: install a real eBPF security agent and characterise it
 # ---------------------------------------------------------------------------
 def run_falco_probe(distro: Distro, ip: str, plugin_so: Path | None = None,
-                    evidence_dir: Path | None = None, fault: dict | None = None) -> dict:
+                    evidence_dir: Path | None = None, fault: dict | None = None,
+                    env: dict[str, str] | None = None) -> dict:
     """
     Push falco_probe.sh to the guest, run it as root, parse its JSON.
 
@@ -629,15 +761,19 @@ def run_falco_probe(distro: Distro, ip: str, plugin_so: Path | None = None,
         if up.returncode != 0:
             return {"error": f"fault upload failed: {up.stderr.strip()[:200]}"}
 
+    # env carries the qualification inputs (KM_PKG_URL and friends, see the
+    # probe's header). Through sudo env, because sudo resets the environment.
+    assignments = " ".join(f"{k}={shlex.quote(v)}" for k, v in sorted((env or {}).items()))
+    command = f"sudo env {assignments} bash /tmp/falco_probe.sh" if assignments \
+        else "sudo bash /tmp/falco_probe.sh"
     log("falco: installing and characterising (this takes a few minutes)")
     try:
         proc = ssh_exec(
-            ip, distro.ssh_user,
-            "sudo bash /tmp/falco_probe.sh",
-            timeout=900,                     # package install over the network is slow
+            ip, distro.ssh_user, command,
+            timeout=1500,                    # an upgrade installs twice and may build a kmod
         )
     except subprocess.TimeoutExpired:
-        return {"error": "probe timed out after 15 minutes"}
+        return {"error": "probe timed out after 25 minutes"}
 
     # The probe prints progress to stderr and exactly one JSON object to
     # stdout, so we can parse stdout without filtering.
@@ -806,7 +942,7 @@ def _git_sha() -> str | None:
 
 
 def build_manifest(result: RunResult, distro: Distro, dest: Path,
-                   collected: bool) -> dict:
+                   collected: bool, labels: dict | None = None) -> dict:
     """
     Describe a bundle well enough to reproduce or audit it later: which run,
     which commit, which kernel, what the checks said, and a hash per file so
@@ -826,8 +962,10 @@ def build_manifest(result: RunResult, distro: Distro, dest: Path,
     return {
         "schema_version": EVIDENCE_SCHEMA,
         "distro": distro.name,
+        "os": distro.os_name,
         "kernel": result.kernel,
         "expect_kernel": distro.expect_kernel,
+        "kernel_variant": distro.kernel_variant or None,
         "tier": distro.tier,
         "firmware": distro.firmware,
         "falco_version": (result.falco or {}).get("falco_version"),
@@ -843,6 +981,9 @@ def build_manifest(result: RunResult, distro: Distro, dest: Path,
         "jenkins": {k.lower(): os.environ.get(k)
                     for k in ("JOB_NAME", "BUILD_NUMBER", "BUILD_TAG")},
         "files": files,
+        # Run dimensions beyond distro, e.g. a qualification run's version
+        # and scenario (qualify.py).
+        **(labels or {}),
     }
 
 
@@ -912,9 +1053,14 @@ def write_junit(result: RunResult, path: Path) -> None:
 # ---------------------------------------------------------------------------
 # One distro, end to end
 # ---------------------------------------------------------------------------
+_VM_SEQ = itertools.count(1)
+
+
 def test_distro(distro: Distro, checks: list[dict], keep: bool = False,
                 with_falco: bool = False, plugin_so: Path | None = None,
-                fault: dict | None = None) -> RunResult:
+                fault: dict | None = None, probe_env: dict[str, str] | None = None,
+                evidence_dir: Path | None = None, labels: dict | None = None,
+                build_prereqs: bool = False) -> RunResult:
     """
     The full lifecycle for a single distro.
 
@@ -924,7 +1070,7 @@ def test_distro(distro: Distro, checks: list[dict], keep: bool = False,
     # A unique name per run means two concurrent runs never collide on a
     # libvirt domain name -- which matters the moment Jenkins runs stages in
     # parallel.
-    vm_name = f"km-{distro.name}-{os.getpid()}-{int(time.time()) % 10000}"
+    vm_name = f"km-{distro.name}-{os.getpid()}-{int(time.time()) % 10000}{next(_VM_SEQ)}"
     result = RunResult(distro=distro.name)
 
     log("=" * 70)
@@ -949,6 +1095,18 @@ def test_distro(distro: Distro, checks: list[dict], keep: bool = False,
             result.error = f"SSH never became available at {ip}"
             return result
 
+        if distro.kernel_packages:
+            ip, problem = install_kernel_variant(distro, ip, vm_name)
+            if problem:
+                result.error = problem
+                return result
+
+        if build_prereqs:
+            ip, result.prereqs, problem = ensure_build_prereqs(distro, ip, vm_name)
+            if problem:
+                result.error = problem
+                return result
+
         result.checks = run_checks(distro, ip, checks)
 
         # capture the kernel we actually saw, for the report
@@ -958,20 +1116,22 @@ def test_distro(distro: Distro, checks: list[dict], keep: bool = False,
                 break
 
         if with_falco:
-            evidence_dir = EVIDENCE / (f"{distro.name}--{fault['id']}" if fault else distro.name)
+            evidence_dir = evidence_dir or EVIDENCE / (
+                f"{distro.name}--{fault['id']}" if fault else distro.name)
             shutil.rmtree(evidence_dir, ignore_errors=True)
             evidence_dir.mkdir(parents=True)
 
             probe_start = time.monotonic()
             result.falco = run_falco_probe(distro, ip, plugin_so=plugin_so,
-                                           evidence_dir=evidence_dir, fault=fault)
+                                           evidence_dir=evidence_dir, fault=fault,
+                                           env=probe_env)
             result.checks.extend(falco_checks(result.falco, time.monotonic() - probe_start))
             if fault:
                 result.fault = fault_outcome(fault, result.checks)
 
             # After the checks, so the manifest records the final outcome.
             collected = collect_evidence(distro, ip, evidence_dir)
-            manifest = build_manifest(result, distro, evidence_dir, collected)
+            manifest = build_manifest(result, distro, evidence_dir, collected, labels)
             (evidence_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
             f = result.falco
             if f.get("error"):
@@ -1026,6 +1186,10 @@ def load_matrix(path: Path) -> tuple[list[Distro], list[dict]]:
             vcpus=merged.get("vcpus", 2),
             boot_timeout_sec=merged.get("boot_timeout_sec", 300),
             firmware=merged.get("firmware", "bios"),
+            base=merged.get("base", ""),
+            os=merged.get("os", ""),
+            kernel_variant=merged.get("kernel_variant", ""),
+            kernel_packages=list(merged.get("kernel_packages", [])),
         ))
     return distros, data["checks"]
 

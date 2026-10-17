@@ -1,0 +1,81 @@
+# ============================================================================
+#  qualification.yaml  --  Falco PACKAGE qualification, as data
+# ============================================================================
+#
+#  matrix.yaml asks "does Falco run on this kernel?" and installs whatever the
+#  stable repo serves. This file asks the question upstream CI does not: does
+#  the actual .deb/.rpm install through the package manager, with its
+#  maintainer scripts running, on real distro kernels, in every way a fleet
+#  installs it?
+#
+#  Upstream's package tests extract the tarball with `cp -r * /`, so postinst
+#  never runs in CI. falcosecurity/falco#3994 (0.45.0 fresh installs fail on
+#  kernels without modern eBPF) shipped through exactly that gap, days after
+#  0.45.0-rc3 and rc4 were published to the dev repo. A grid that watches
+#  pre-releases is the point of this file.
+#
+#  Grid: versions x targets x scenarios. Each cell boots one VM.
+#  qualify.py runs it; results land in results/qualification/<version>/.
+#
+#  ---------------------------------------------------------------------------
+#  Fields
+#  ---------------------------------------------------------------------------
+#    download      base URL. Versions with "-rc" or "+" (dev builds) resolve
+#                  to the dev channel (packages/deb-dev, packages/rpm-dev),
+#                  everything else to stable. See qualify.package_url.
+#    versions      what to qualify by default. Override with --version.
+#    upgrade_from  N-1 for the upgrade scenario.
+#    targets       matrix.yaml entry names. A kernel variant (e.g.
+#                  ubuntu-20.04-hwe) is its own target, reported under its
+#                  release with a different kernel label.
+#    scenarios     driver_choice is exported to the maintainer scripts as
+#                  FALCO_DRIVER_CHOICE. Empty leaves it unset. upgrade: true
+#                  installs upgrade_from first, then the version under test
+#                  (dpkg --force-confdef --force-confold).
+# ============================================================================
+
+download: https://download.falco.org/packages
+
+versions:
+  - 0.45.0
+  - 0.45.1-rc1
+
+upgrade_from: 0.44.1
+
+targets:
+  # The kernel boundary first: these are where #3994 lives.
+  - ubuntu-20.04          # 5.4, no modern eBPF
+  - ubuntu-20.04-hwe      # same release on 5.15: does the failure follow the kernel?
+  - ubuntu-18.04          # 4.15
+  - debian-11             # 5.10
+  - rocky-8               # 4.18
+  - centos-7              # 3.10, glibc 2.17: 0.41+ cannot install at all
+  # Modern kernels: the control group.
+  - ubuntu-22.04
+  - ubuntu-24.04
+  - debian-12
+  - rocky-9
+  - almalinux-9
+  - fedora-44
+
+scenarios:
+  - id: fresh-auto
+    driver_choice: auto
+    description: Fresh install, automatic driver selection (the package default).
+
+  - id: fresh-kmod
+    driver_choice: kmod
+    description: Fresh install, kernel module. dkms, gcc and headers are present.
+
+  - id: fresh-modern_ebpf
+    driver_choice: modern_ebpf
+    description: >-
+      Fresh install, modern eBPF. On a kernel that cannot run it the service
+      is expected not to start; the package should still configure cleanly.
+
+  - id: upgrade
+    driver_choice: ""
+    upgrade: true
+    description: >-
+      upgrade_from installed with automatic selection, then upgraded in place
+      non-interactively, keeping existing configuration files.

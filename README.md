@@ -171,6 +171,74 @@ runs write to `results/faults/`, never into `results.json` or the dashboard.
 
 ---
 
+## Package qualification
+
+`provision.py --falco` answers "does Falco run on this kernel?" and repairs known
+packaging bugs so the driver can still be measured. `qualify.py` answers the release
+question instead: does the actual `.deb`/`.rpm` install through the package manager, with
+its maintainer scripts running, on real distro kernels, in every way a fleet installs it?
+
+Upstream's package tests extract the tarball with `cp -r * /`, so `postinst` never runs
+in CI. falcosecurity/falco#3994 (0.45.0 fresh installs fail on kernels without modern
+eBPF) shipped through exactly that gap, days after 0.45.0-rc3 and rc4 sat in the dev repo.
+
+```bash
+python3 qualify.py --dry-run                     # plan, and check every package URL exists
+python3 qualify.py                               # versions x targets x scenarios, 4 VMs at a time
+python3 qualify.py --version 0.45.1-rc1 --target ubuntu-20.04 --scenario fresh-auto
+python3 qualify.py --matrix-only                 # rebuild matrix.json and print the grid
+```
+
+The grid is data in [`qualification.yaml`](qualification.yaml): versions (release
+candidates resolve to Falco's dev repo), targets from `matrix.yaml`, and four scenarios:
+fresh install with `FALCO_DRIVER_CHOICE` auto, kmod and modern_ebpf, and an in-place
+upgrade from N-1 with `--force-confdef --force-confold`.
+
+Build prerequisites are a gate, not a best effort: `build_prereqs.sh` makes sure dkms,
+make, gcc and the running kernel's headers are present before the package goes in, and a
+cell where they cannot be met is a harness `error`, never a package `fail`. The first grid
+without it reported kmod failures on debian-11 and rocky-8 that were really the host: dkms
+lives in EPEL on EL8/9, and Debian 11's security repo 404s the headers for the cloud
+image's kernel since its LTS ended (repointed at archive.debian.org, like CentOS 7's vault).
+If the archive has no headers for the image's kernel at all, the gate moves to the kernel
+the archive does carry and reboots into it.
+
+The probe runs **strict**: it installs the package file it was given, never the repo's
+copy, and repairs nothing. Four checks, all decided by code from what the guest reports:
+
+| Check | Passes when |
+|---|---|
+| `pkg_installed` | package manager exit 0, package fully configured (not `half-configured`), no maintainer script reported failure (dnf only warns), requested version |
+| `driver_loaded` | `/sys/module/falco` exists, or the running sensor holds BPF programs (`/proc/<pid>/fd`) |
+| `service_active` | an engine unit is running, stable for 3 samples, started by the maintainer scripts alone |
+| `event_detected` | a read of `/etc/shadow` raised an alert |
+
+A cell is `pass`, `fail` (first failed check, with what was seen), `unsupported`
+(modern_ebpf on a kernel that cannot run it, with the package still configured cleanly),
+`blocked` (the N-1 package never installed, so no upgrade was attempted) or `error` (the
+harness could not ask: no VM, wrong kernel, no prerequisites, no probe data). Secure Boot
+state is recorded per cell, not judged: under Secure Boot the kernel rejects an unsigned
+dkms module, so a red kmod cell on such a host can be the host's policy (rocky-9 boots UEFI,
+and libvirt's firmware autoselection enables Secure Boot).
+
+Kernel variants test whether a failure follows the kernel or the distro: `ubuntu-20.04-hwe`
+is the same release booted on its 5.15 HWE kernel, installed in the VM and rebooted into
+(`install_kernel_variant` in provision.py), with `kernel_version_matches_expectation`
+proving the reboot took.
+
+Output, per version, plus one file for a dashboard:
+
+```
+results/qualification/<version>/<distro>--<kernel>--<scenario>.json
+results/qualification/<version>/evidence/<cell>/    bundle, incl. install.log and falcoctl config
+results/qualification/<version>/logs/<cell>.log
+results/qualification/matrix.json                   every cell: status, checks, links to result + evidence
+```
+
+The first run (0.45.0, 0.45.1-rc1, 0.45.0-rc4) and what it found: [`QUALIFICATION.md`](QUALIFICATION.md).
+
+---
+
 ## Layout
 
 ```
@@ -179,6 +247,10 @@ provision.py         boot, wait, check, characterise, destroy
 falco_probe.sh       runs inside the guest; emits JSON
 collect_evidence.sh  runs inside the guest after the probe; read-only evidence bundle
 faults.yaml          deliberate, verified breakage for labelled triage cases
+qualify.py           package qualification: version x distro/kernel x scenario
+qualification.yaml   the qualification grid, as data
+build_prereqs.sh     runs inside the guest before a qualification probe; dkms, gcc, headers
+QUALIFICATION.md     what the first qualification grid found
 report.py            results.json -> self-contained HTML; archives every run,
                      diffs against the previous one ("vs last run" column),
                      and checks GitHub for untested upstream Falco releases

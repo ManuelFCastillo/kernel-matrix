@@ -80,6 +80,41 @@ PLUGIN_MODE="stock"     # stock | patched | workaround -- how the container
 ERROR=""
 ERROR_DETAIL=""          # tail of the failing command, see tail_detail
 
+# ---------------------------------------------------------------------------
+# Package qualification mode (qualify.py). Set by the host, never by hand.
+#
+#   KM_PKG_URL        install THIS .deb/.rpm through the package manager
+#                     instead of the repo's latest, so a release candidate
+#                     can be tested before it reaches the stable repo
+#   KM_BASE_PKG_URL   upgrade scenario: install this one first (N-1)
+#   KM_DRIVER_CHOICE  passed to the maintainer scripts as FALCO_DRIVER_CHOICE;
+#                     empty leaves it unset, which is what an upgrade sees
+#
+# Setting KM_PKG_URL makes the probe STRICT: it observes and never repairs.
+# No unit-file patching, no enabling units by hand, no plugin workaround.
+# Those rescues exist so the characterisation can measure drivers on hosts
+# with known packaging bugs; a qualification run exists to find exactly
+# those bugs, and one rescue would hide the thing it is looking for.
+# ---------------------------------------------------------------------------
+KM_PKG_URL=${KM_PKG_URL:-}
+KM_BASE_PKG_URL=${KM_BASE_PKG_URL:-}
+KM_DRIVER_CHOICE=${KM_DRIVER_CHOICE:-}
+STRICT=false
+[ -n "$KM_PKG_URL" ] && STRICT=true
+PKG_LOG=/var/log/km-pkg-install.log     # every package-manager word, for evidence
+PKG_EXIT=-1             # package manager exit code for the package under test
+PKG_STATE=""            # dpkg Status, or "installed"/"absent" from rpm -q
+PKG_VERSION=""
+PKG_SHA256=""
+SCRIPTLET_FAILED=false  # a maintainer script (postinst, %post) reported failure
+BASE_EXIT=-1            # same three for the N-1 package in an upgrade
+BASE_STATE=""
+BASE_VERSION=""
+KMOD_LOADED=false       # kernel-side driver evidence, independent of any log
+SECURE_BOOT=false       # an unsigned dkms module cannot load under Secure Boot
+BPF_PROG_FDS=0
+ACTIVE_UNIT=""
+
 emit_and_exit() {
     # One JSON object. Keep key names stable: the report and the metrics
     # exporter both depend on them.
@@ -98,6 +133,19 @@ emit_and_exit() {
   "rule_matched": "$(json_safe "$RULE_MATCHED")",
   "bpf_load_errors": ${BPF_ERRORS:-0},
   "plugin_mode": "$(json_safe "$PLUGIN_MODE")",
+  "strict": $STRICT,
+  "pkg_exit": $PKG_EXIT,
+  "pkg_state": "$(json_safe "$PKG_STATE")",
+  "pkg_version": "$(json_safe "$PKG_VERSION")",
+  "pkg_sha256": "$(json_safe "$PKG_SHA256")",
+  "scriptlet_failed": $SCRIPTLET_FAILED,
+  "base_exit": $BASE_EXIT,
+  "base_state": "$(json_safe "$BASE_STATE")",
+  "base_version": "$(json_safe "$BASE_VERSION")",
+  "kmod_loaded": $KMOD_LOADED,
+  "bpf_prog_fds": ${BPF_PROG_FDS:-0},
+  "active_unit": "$(json_safe "$ACTIVE_UNIT")",
+  "secure_boot": $SECURE_BOOT,
   "error": "$(json_safe "$ERROR")",
   "error_detail": "$(json_safe "$ERROR_DETAIL" 2000)"
 }
@@ -106,9 +154,128 @@ JSON
 }
 
 # ---------------------------------------------------------------------------
+# Strict package install (qualification mode only)
+# ---------------------------------------------------------------------------
+# pkg_scriptlet_failed LOG: did a maintainer script report failure? dpkg fails
+# the whole command, but rpm and dnf only WARN and exit 0 ("Non-fatal POSTIN
+# scriptlet failure"), so the exit code alone would call a broken %post a
+# clean install.
+pkg_scriptlet_failed() {
+    grep -qiE -- "-(installation|removal) script.*returned error exit status|scriptlet failed|scriptlet failure|Error in [A-Z]+ scriptlet" "$1"
+}
+
+# pkg_query: "STATE|VERSION" for the installed falco package. dpkg reports a
+# postinst that died as "install ok half-configured", which is the state
+# falcosecurity/falco#3994 leaves behind.
+pkg_query() {
+    local out
+    if command -v dpkg-query >/dev/null 2>&1; then
+        out=$(dpkg-query -W -f='${Status}|${Version}' falco 2>/dev/null) || out="absent|"
+    else
+        out=$(rpm -q --qf 'installed|%{VERSION}-%{RELEASE}' falco 2>/dev/null) || out="absent|"
+    fi
+    printf '%s\n' "$out"
+}
+
+pkg_state_ok() {
+    [ "$1" = "install ok installed" ] || [ "$1" = "installed" ]
+}
+
+# pkg_install FILE STEPLOG: install one local package file through the package
+# manager, so its maintainer scripts run exactly as they would for a customer.
+# Returns the package manager's exit code.
+pkg_install() {
+    local file=$1 steplog=$2 choice_env=""
+    [ -n "$KM_DRIVER_CHOICE" ] && choice_env="FALCO_DRIVER_CHOICE=$KM_DRIVER_CHOICE"
+    {
+        echo "\$ install $(basename "$file") (FALCO_DRIVER_CHOICE=${KM_DRIVER_CHOICE:-<unset>})"
+        if command -v apt-get >/dev/null 2>&1; then
+            # confdef/confold answer conffile prompts the way an unattended
+            # fleet upgrade does: keep the configuration already on the host.
+            env $choice_env FALCO_FRONTEND=noninteractive DEBIAN_FRONTEND=noninteractive \
+                apt-get install -y -o Dpkg::Options::=--force-confdef \
+                -o Dpkg::Options::=--force-confold "$file"
+        elif command -v dnf >/dev/null 2>&1; then
+            env $choice_env FALCO_FRONTEND=noninteractive dnf install -y "$file"
+        else
+            env $choice_env FALCO_FRONTEND=noninteractive yum install -y "$file"
+        fi
+    } > "$steplog" 2>&1
+    local rc=$?
+    echo "[exit $rc]" >> "$steplog"
+    return $rc
+}
+
+# pkg_qualify: the install step of a qualification run. Optionally installs
+# the N-1 package first (upgrade scenario), then the package under test.
+# A baseline that does not install cleanly sets BLOCKED: the upgrade was never
+# attempted, which is not the same finding as an upgrade that failed.
+BLOCKED=""
+pkg_qualify() {
+    local ext=deb dir=/var/tmp/km-pkg step=/var/tmp/km-pkg/step.log
+    command -v apt-get >/dev/null 2>&1 || ext=rpm
+    mkdir -p "$dir"
+    : > "$PKG_LOG"
+    if [ -n "$KM_BASE_PKG_URL" ]; then
+        if ! curl -fsSL --retry 3 -o "$dir/base.$ext" "$KM_BASE_PKG_URL" >> "$PKG_LOG" 2>&1; then
+            ERROR="could not download baseline package $KM_BASE_PKG_URL"; BLOCKED=1; return
+        fi
+        pkg_install "$dir/base.$ext" "$step"
+        BASE_EXIT=$?
+        cat "$step" >> "$PKG_LOG"
+        IFS='|' read -r BASE_STATE BASE_VERSION <<EOF
+$(pkg_query)
+EOF
+        say "baseline install: exit $BASE_EXIT, ${BASE_STATE:-absent} ${BASE_VERSION}"
+        if [ "$BASE_EXIT" -ne 0 ] || pkg_scriptlet_failed "$step" || ! pkg_state_ok "$BASE_STATE"; then
+            ERROR="baseline (N-1) install did not complete: exit $BASE_EXIT, ${BASE_STATE:-absent}"
+            ERROR_DETAIL=$(tail_detail "$(cat "$step")")
+            BLOCKED=1
+            return
+        fi
+    fi
+    if ! curl -fsSL --retry 3 -o "$dir/target.$ext" "$KM_PKG_URL" >> "$PKG_LOG" 2>&1; then
+        ERROR="could not download $KM_PKG_URL"; return
+    fi
+    PKG_SHA256=$(sha256sum "$dir/target.$ext" | cut -d' ' -f1)
+    pkg_install "$dir/target.$ext" "$step"
+    PKG_EXIT=$?
+    cat "$step" >> "$PKG_LOG"
+    pkg_scriptlet_failed "$step" && SCRIPTLET_FAILED=true
+    IFS='|' read -r PKG_STATE PKG_VERSION <<EOF
+$(pkg_query)
+EOF
+    say "package install: exit $PKG_EXIT, ${PKG_STATE:-absent} ${PKG_VERSION}, scriptlet_failed=$SCRIPTLET_FAILED"
+    if [ "$PKG_EXIT" -eq 0 ] && [ "$SCRIPTLET_FAILED" = false ] && pkg_state_ok "$PKG_STATE"; then
+        INSTALLED=true
+    else
+        ERROR=$(grep -iE "^E:|error|scriptlet" "$step" | head -1 | tr -d '"' | cut -c1-160)
+        ERROR=${ERROR:-"package install did not complete: exit $PKG_EXIT, ${PKG_STATE:-absent}"}
+        ERROR_DETAIL=$(tail_detail "$(cat "$step")")
+    fi
+}
+
+# driver_evidence PID: is a driver actually in the kernel? Read from the
+# kernel, not from a log line: the falco module in /sys/module, or BPF
+# programs held open by the running sensor.
+driver_evidence() {
+    [ -d /sys/module/falco ] && KMOD_LOADED=true
+    if [ -n "${1:-}" ] && [ "$1" != "0" ] && [ -d "/proc/$1/fd" ]; then
+        BPF_PROG_FDS=$(ls -l "/proc/$1/fd" 2>/dev/null | grep -c 'anon_inode:bpf-prog')
+    fi
+    BPF_PROG_FDS=${BPF_PROG_FDS:-0}
+}
+
+# ---------------------------------------------------------------------------
 # 1. INSTALL
 # ---------------------------------------------------------------------------
 say "kernel: $(uname -r)"
+# The last byte of the SecureBoot EFI variable is 1 when it is enforced.
+SB_VAR=$(ls /sys/firmware/efi/efivars/SecureBoot-* 2>/dev/null | head -1)
+if [ -n "$SB_VAR" ] && [ "$(od -An -t u1 "$SB_VAR" 2>/dev/null | awk '{print $NF}')" = "1" ]; then
+    SECURE_BOOT=true
+    say "secure boot: enforced"
+fi
 install_start=$(date +%s)
 
 # ---------------------------------------------------------------------------
@@ -133,31 +300,39 @@ if command -v apt-get >/dev/null 2>&1; then
         || say "WARNING: could not install headers/dkms; kmod fallback will be unavailable"
 
 
-    # Preseed the debconf answers so the package never prompts. Without this
-    # the install hangs forever waiting for a driver choice that nobody is
-    # there to give -- a classic unattended-install trap.
-    echo "falco falco/dkms note" | debconf-set-selections 2>/dev/null
-    echo "falco falco/driver_choice select Modern eBPF" | debconf-set-selections 2>/dev/null
-    echo "falco falco/unified_deb_multi_install boolean true" | debconf-set-selections 2>/dev/null
+    # Strict mode installs a package FILE (pkg_qualify) and must not see the
+    # Falco repo at all: given a local .deb whose version the repo also
+    # carries, apt downloads the repo's copy instead, and the run would test
+    # whatever the repo serves rather than the file it named.
+    if [ "$STRICT" != true ]; then
+        # Preseed the debconf answers so the package never prompts. Without this
+        # the install hangs forever waiting for a driver choice that nobody is
+        # there to give -- a classic unattended-install trap.
+        echo "falco falco/dkms note" | debconf-set-selections 2>/dev/null
+        echo "falco falco/driver_choice select Modern eBPF" | debconf-set-selections 2>/dev/null
+        echo "falco falco/unified_deb_multi_install boolean true" | debconf-set-selections 2>/dev/null
 
-    # Store the ASCII-armored key AS-IS rather than dearmoring it.
-    #
-    # Every guide online pipes the .asc through `gpg --dearmor`, which fails
-    # outright on minimal images: Ubuntu's cloud image ships gnupg, Debian's
-    # does not, so the same command works on one and dies with "gpg: command
-    # not found" on the other.
-    #
-    # apt has accepted armored keys in signed-by since apt 1.4, so the
-    # dearmor step is unnecessary and the dependency on gnupg disappears.
-    install -d -m 0755 /etc/apt/keyrings
-    curl -fsSL https://falco.org/repo/falcosecurity-packages.asc \
-        -o /etc/apt/keyrings/falcosecurity.asc 2>/dev/null
-    chmod 0644 /etc/apt/keyrings/falcosecurity.asc
-    echo "deb [signed-by=/etc/apt/keyrings/falcosecurity.asc] https://download.falco.org/packages/deb stable main" \
-        > /etc/apt/sources.list.d/falcosecurity.list
+        # Store the ASCII-armored key AS-IS rather than dearmoring it.
+        #
+        # Every guide online pipes the .asc through `gpg --dearmor`, which fails
+        # outright on minimal images: Ubuntu's cloud image ships gnupg, Debian's
+        # does not, so the same command works on one and dies with "gpg: command
+        # not found" on the other.
+        #
+        # apt has accepted armored keys in signed-by since apt 1.4, so the
+        # dearmor step is unnecessary and the dependency on gnupg disappears.
+        install -d -m 0755 /etc/apt/keyrings
+        curl -fsSL https://falco.org/repo/falcosecurity-packages.asc \
+            -o /etc/apt/keyrings/falcosecurity.asc 2>/dev/null
+        chmod 0644 /etc/apt/keyrings/falcosecurity.asc
+        echo "deb [signed-by=/etc/apt/keyrings/falcosecurity.asc] https://download.falco.org/packages/deb stable main" \
+            > /etc/apt/sources.list.d/falcosecurity.list
 
-    apt-get update -qq >/dev/null 2>&1
-    if APT_ERR=$(apt-get install -y -qq falco 2>&1); then
+        apt-get update -qq >/dev/null 2>&1
+    fi
+    if [ "$STRICT" = true ]; then
+        pkg_qualify
+    elif APT_ERR=$(apt-get install -y -qq falco 2>&1); then
         INSTALLED=true
     else
         # Keep the actual failure. "apt install failed" told us nothing and
@@ -187,10 +362,15 @@ elif command -v yum >/dev/null 2>&1 && ! command -v dnf >/dev/null 2>&1; then
     yum install -y -q epel-release >/dev/null 2>&1
     yum install -y -q dkms make gcc "kernel-devel-$(uname -r)" >/dev/null 2>&1 \
         || say "WARNING: could not install headers/dkms"
-    rpm --import https://falco.org/repo/falcosecurity-packages.asc >/dev/null 2>&1
-    curl -fsSL -o /etc/yum.repos.d/falcosecurity.repo \
-        https://falco.org/repo/falcosecurity-rpm.repo >/dev/null 2>&1
-    if YUM_ERR=$(yum install -y -q falco 2>&1); then
+    if [ "$STRICT" != true ]; then     # strict: the file, never the repo (see apt)
+        rpm --import https://falco.org/repo/falcosecurity-packages.asc >/dev/null 2>&1
+        curl -fsSL -o /etc/yum.repos.d/falcosecurity.repo \
+            https://falco.org/repo/falcosecurity-rpm.repo >/dev/null 2>&1
+    fi
+    # No 0.40.0 fallback in strict mode: "cannot install here" is the finding.
+    if [ "$STRICT" = true ]; then
+        pkg_qualify
+    elif YUM_ERR=$(yum install -y -q falco 2>&1); then
         INSTALLED=true
     elif echo "$YUM_ERR" | grep -q "GLIBC"; then
         # Falco 0.41.0+ links against GLIBC_2.28; EL7 ships 2.17. The repo
@@ -220,10 +400,14 @@ elif command -v dnf >/dev/null 2>&1; then
     say "installing build prerequisites for fallback drivers"
     dnf install -y -q dkms make gcc "kernel-devel-$(uname -r)" >/dev/null 2>&1 \
         || say "WARNING: could not install headers/dkms"
-    rpm --import https://falco.org/repo/falcosecurity-packages.asc >/dev/null 2>&1
-    curl -fsSL -o /etc/yum.repos.d/falcosecurity.repo \
-        https://falco.org/repo/falcosecurity-rpm.repo >/dev/null 2>&1
-    if DNF_ERR=$(dnf install -y -q falco 2>&1); then
+    if [ "$STRICT" != true ]; then     # strict: the file, never the repo (see apt)
+        rpm --import https://falco.org/repo/falcosecurity-packages.asc >/dev/null 2>&1
+        curl -fsSL -o /etc/yum.repos.d/falcosecurity.repo \
+            https://falco.org/repo/falcosecurity-rpm.repo >/dev/null 2>&1
+    fi
+    if [ "$STRICT" = true ]; then
+        pkg_qualify
+    elif DNF_ERR=$(dnf install -y -q falco 2>&1); then
         INSTALLED=true
     else
         ERROR=$(echo "$DNF_ERR" | grep -iE "error|cannot|conflict|nothing provides" | head -1)
@@ -245,7 +429,14 @@ fi
 
 INSTALL_SECONDS=$(( $(date +%s) - install_start ))
 say "install: $INSTALLED (${INSTALL_SECONDS}s)"
-[ "$INSTALLED" = "true" ] || emit_and_exit
+if [ "$INSTALLED" != "true" ]; then
+    # Strict mode keeps observing while the binary is on disk: a package left
+    # half-configured may still have started a service, or failed to, and
+    # which of those happened is part of the finding.
+    if [ "$STRICT" != true ] || [ -n "$BLOCKED" ] || ! command -v falco >/dev/null 2>&1; then
+        emit_and_exit
+    fi
+fi
 
 FALCO_VERSION=$(falco --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
 FALCO_VERSION=${FALCO_VERSION:-unknown}
@@ -363,17 +554,24 @@ start_ts=$(date +%s)
 # "this kernel is unsupported". A drop-in cannot rescue it because the base
 # file still fails to parse, so patch the unit files themselves. Normalising
 # to /bin/kill is a no-op on modern systemd and a full fix on old.
-sed -i 's|^ExecReload=kill|ExecReload=/bin/kill|' \
-    /usr/lib/systemd/system/falco*.service \
-    /lib/systemd/system/falco*.service 2>/dev/null
-systemctl daemon-reload 2>/dev/null
+# Not in strict mode: there the shipped unit files are what is under test.
+if [ "$STRICT" != true ]; then
+    sed -i 's|^ExecReload=kill|ExecReload=/bin/kill|' \
+        /usr/lib/systemd/system/falco*.service \
+        /lib/systemd/system/falco*.service 2>/dev/null
+    systemctl daemon-reload 2>/dev/null
+fi
 
 try_start() {
     # Nudge whichever ones are installed; only the viable one will stay up.
-    for candidate in falco-modern-bpf.service falco-bpf.service falco-kmod.service falco.service; do
-        systemctl list-unit-files "$candidate" >/dev/null 2>&1 && \
-            systemctl enable --now "$candidate" >/dev/null 2>&1
-    done
+    # Strict mode only watches: whether the maintainer scripts enabled and
+    # started the right unit is the thing being qualified.
+    if [ "$STRICT" != true ]; then
+        for candidate in falco-modern-bpf.service falco-bpf.service falco-kmod.service falco.service; do
+            systemctl list-unit-files "$candidate" >/dev/null 2>&1 && \
+                systemctl enable --now "$candidate" >/dev/null 2>&1
+        done
+    fi
 
     UNIT=""
     STABLE=0
@@ -409,7 +607,8 @@ try_start || true
 # blind spot right back.
 # Never under an injected fault: the workaround would "fix" a deliberately
 # broken plugin and report the row healthy.
-if [ "$STARTED" != "true" ] && [ "$PLUGIN_MODE" != "workaround" ] && [ -z "$FAULT_ACTIVE" ]; then
+if [ "$STARTED" != "true" ] && [ "$PLUGIN_MODE" != "workaround" ] && [ -z "$FAULT_ACTIVE" ] \
+   && [ "$STRICT" != true ]; then
     # Query the engine units explicitly and deep: a bare 'falco*' glob also
     # matches falcoctl-artifact-follow, whose download chatter can push the
     # actual load error out of a shallow tail window -- which made this
@@ -449,8 +648,10 @@ if [ "$STARTED" != "true" ]; then
               | tail -1 | sed 's/^.*]: //')
         ATTEMPTS="${ATTEMPTS}${candidate}: ${why:-did not start}; "
     done
-    ERROR="${ATTEMPTS:-no falco unit became active}"
+    # Keep a package-install error as the headline: it is the cause.
+    [ "$STRICT" = true ] && [ -n "$ERROR" ] || ERROR="${ATTEMPTS:-no falco unit became active}"
     DRIVER="none"
+    driver_evidence ""
     emit_and_exit
 fi
 
@@ -475,6 +676,7 @@ else
         *)                        DRIVER="unknown" ;;
     esac
 fi
+ACTIVE_UNIT="$UNIT"
 say "unit: $UNIT"
 say "driver: $DRIVER"
 
@@ -511,6 +713,8 @@ if [ -n "$PID" ] && [ "$PID" != "0" ] && [ -r "/proc/$PID/stat" ]; then
 fi
 RSS_KB=${RSS_KB:-0}
 CPU_PERCENT=${CPU_PERCENT:-0}
+driver_evidence "$PID"
+say "driver evidence: kmod_loaded=$KMOD_LOADED bpf_prog_fds=$BPF_PROG_FDS"
 say "idle cost: ${RSS_KB}KB RSS, ${CPU_PERCENT}% CPU"
 
 # ---------------------------------------------------------------------------
