@@ -1,0 +1,473 @@
+<title>Kestrel QA</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@600;700&family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<style>
+/* Layout: a flight-deck board. Verdict tiles across the top, the qualification
+   grid as the main instrument, failure signatures and checks beside it, and a
+   drawer that opens one cell's evidence. Dark first; light mirrors it. */
+:root {
+  --bg: #08131f;  --panel: #0e1d2e;  --panel-2: #12263b;  --line: #1d3550;
+  --fg: #e3ecf6;  --muted: #8ba1b9;  --faint: #5d7690;
+  --accent: #46c8ef;  --accent-ink: #052a38;
+  --pass: #2ec4a8;  --fail: #f0566e;  --warn: #f2b545;  --err: #a98bff;  --idle: #6b7f96;
+  --pass-bg: rgba(46,196,168,.13); --fail-bg: rgba(240,86,110,.15); --warn-bg: rgba(242,181,69,.14);
+  --err-bg: rgba(169,139,255,.14); --idle-bg: rgba(107,127,150,.12); --accent-bg: rgba(70,200,239,.12);
+  --shadow: 0 1px 0 rgba(255,255,255,.03) inset, 0 12px 30px rgba(0,0,0,.25);
+  --f-display: "Barlow Condensed", "Arial Narrow", "Roboto Condensed", sans-serif;
+  --f-body: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --f-mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+  color-scheme: dark;
+}
+@media (prefers-color-scheme: light) { :root:not([data-theme="dark"]) {
+  --bg: #eef3f8; --panel: #ffffff; --panel-2: #f3f7fb; --line: #d6e1ec;
+  --fg: #0f2133; --muted: #4f667e; --faint: #7d93a9;
+  --accent: #0b86b3; --accent-ink: #ffffff;
+  --pass: #0f8f78; --fail: #cc2f4b; --warn: #a86b00; --err: #6b4fd8; --idle: #6b7f96;
+  --pass-bg: rgba(15,143,120,.10); --fail-bg: rgba(204,47,75,.10); --warn-bg: rgba(168,107,0,.10);
+  --err-bg: rgba(107,79,216,.10); --idle-bg: rgba(107,127,150,.10); --accent-bg: rgba(11,134,179,.10);
+  --shadow: 0 1px 2px rgba(15,33,51,.06), 0 8px 24px rgba(15,33,51,.06);
+  color-scheme: light; } }
+:root[data-theme="light"] {
+  --bg: #eef3f8; --panel: #ffffff; --panel-2: #f3f7fb; --line: #d6e1ec;
+  --fg: #0f2133; --muted: #4f667e; --faint: #7d93a9;
+  --accent: #0b86b3; --accent-ink: #ffffff;
+  --pass: #0f8f78; --fail: #cc2f4b; --warn: #a86b00; --err: #6b4fd8; --idle: #6b7f96;
+  --pass-bg: rgba(15,143,120,.10); --fail-bg: rgba(204,47,75,.10); --warn-bg: rgba(168,107,0,.10);
+  --err-bg: rgba(107,79,216,.10); --idle-bg: rgba(107,127,150,.10); --accent-bg: rgba(11,134,179,.10);
+  --shadow: 0 1px 2px rgba(15,33,51,.06), 0 8px 24px rgba(15,33,51,.06);
+  color-scheme: light; }
+
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+body { margin: 0; }
+body { background: var(--bg); color: var(--fg); font: 400 14px/1.5 var(--f-body); }
+.wrap { max-width: 1440px; margin: 0 auto; padding-inline: 20px; padding-block: 16px 40px; display: grid; gap: 16px; }
+a { color: var(--accent); }
+button, select { font: inherit; color: inherit; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.mono { font-family: var(--f-mono); font-variant-numeric: tabular-nums; }
+.muted { color: var(--muted); }
+.label { font-size: 11px; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); font-weight: 600; }
+
+/* --- header ------------------------------------------------------------ */
+.top { display: flex; flex-wrap: wrap; align-items: center; gap: 14px 22px; }
+.brand { display: flex; align-items: center; gap: 12px; margin-right: auto; min-width: 0; }
+.brand svg { width: 44px; height: 44px; flex: none; }
+.brand b { font: 700 28px/1 var(--f-display); letter-spacing: .06em; display: block; }
+.brand b span { color: var(--accent); }
+.brand small { color: var(--muted); font-size: 12px; }
+.field { display: grid; gap: 4px; }
+.field select { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 8px 34px 8px 12px; min-width: 210px; font-family: var(--f-mono); font-size: 14px; }
+.pill { display: inline-flex; align-items: center; gap: 8px; border: 1px solid var(--line); background: var(--panel); border-radius: 999px; padding: 6px 12px; font-size: 12.5px; color: var(--muted); white-space: nowrap; }
+.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--idle); flex: none; }
+.pill.live .dot { background: var(--pass); box-shadow: 0 0 0 0 var(--pass); animation: beat 2s infinite; }
+.btn { display: inline-flex; align-items: center; gap: 8px; border: 1px solid var(--accent); color: var(--accent); background: var(--accent-bg); border-radius: 8px; padding: 7px 14px; text-decoration: none; font-weight: 500; font-size: 13px; cursor: pointer; }
+.btn:hover { background: var(--accent); color: var(--accent-ink); }
+@keyframes beat { 0% { box-shadow: 0 0 0 0 rgba(46,196,168,.55); } 70% { box-shadow: 0 0 0 7px rgba(46,196,168,0); } 100% { box-shadow: 0 0 0 0 rgba(46,196,168,0); } }
+
+/* --- tiles ------------------------------------------------------------- */
+.tiles { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; }
+.tile { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 16px 18px; display: grid; gap: 6px; box-shadow: var(--shadow); min-width: 0; }
+.big { font: 700 40px/1 var(--f-display); letter-spacing: .02em; font-variant-numeric: tabular-nums; }
+.tile .sub { color: var(--muted); font-size: 13px; }
+.tile.verdict { border-left: 4px solid var(--idle); }
+.tile.verdict.blocked { border-left-color: var(--fail); }
+.tile.verdict.blocked .big { color: var(--fail); }
+.tile.verdict.clear { border-left-color: var(--pass); }
+.tile.verdict.clear .big { color: var(--pass); }
+.tile.verdict.running .big { color: var(--accent); }
+.stack { display: flex; height: 8px; border-radius: 4px; overflow: hidden; background: var(--idle-bg); }
+.stack i { display: block; height: 100%; }
+
+/* --- panels ------------------------------------------------------------ */
+.main { display: grid; grid-template-columns: minmax(0, 1fr) minmax(300px, 400px); gap: 16px; align-items: start; }
+.col { display: grid; gap: 16px; min-width: 0; }
+.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; box-shadow: var(--shadow); min-width: 0; }
+.panel > header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 14px; padding: 14px 18px 10px; }
+.panel > header h2 { font: 600 17px/1.2 var(--f-body); margin: 0; }
+.panel > header p { margin: 0; color: var(--muted); font-size: 13px; flex-basis: 100%; }
+.legend { display: flex; flex-wrap: wrap; gap: 6px 14px; margin-left: auto; font-size: 12px; color: var(--muted); }
+.legend span { display: inline-flex; align-items: center; gap: 6px; }
+.legend i { width: 10px; height: 10px; border-radius: 3px; display: inline-block; background: currentColor; border: 0; }
+
+/* --- grid -------------------------------------------------------------- */
+.gridwrap { overflow-x: auto; padding: 0 10px 12px; }
+table.grid { border-collapse: separate; border-spacing: 6px; width: 100%; min-width: 640px; table-layout: fixed; }
+.grid col.rowcol { width: 170px; }
+.grid th { font-weight: 500; font-size: 12px; color: var(--muted); text-align: center; padding: 4px; vertical-align: bottom; }
+.grid th small { display: block; color: var(--faint); font-weight: 400; }
+.grid th.row { text-align: left; white-space: nowrap; font-size: 13.5px; color: var(--fg); padding-right: 10px; position: sticky; left: 0; background: var(--panel); z-index: 1; }
+.grid th.row small { display: inline; margin-left: 6px; font-family: var(--f-mono); }
+.cell { width: 100%; min-height: 44px; border-radius: 8px; border: 1px solid transparent; display: grid; place-items: center; gap: 0; padding: 6px 4px; cursor: pointer; position: relative; background: var(--idle-bg); color: var(--idle); transition: transform .12s ease; }
+.cell:hover { transform: translateY(-1px); border-color: currentColor; }
+.cell .g { font: 600 15px/1 var(--f-mono); }
+.cell .d { font: 400 10.5px/1.2 var(--f-mono); color: var(--muted); }
+.s-pass { background: var(--pass-bg); color: var(--pass); }
+.s-fail { background: var(--fail-bg); color: var(--fail); }
+.s-error { background: var(--err-bg); color: var(--err); }
+.s-unsupported { background: var(--warn-bg); color: var(--warn); }
+.s-blocked { background: var(--idle-bg); color: var(--idle); }
+.s-running { background: var(--accent-bg); color: var(--accent); }
+.s-running::after { content: ""; position: absolute; inset: -1px; border-radius: 8px; border: 1px solid var(--accent); animation: ring 1.6s ease-in-out infinite; }
+.s-queued, .s-notrun { background: transparent; border: 1px dashed var(--line); color: var(--faint); cursor: default; }
+.cell .new { position: absolute; top: -7px; right: -5px; font: 600 9px/1 var(--f-mono); letter-spacing: .06em; background: var(--fail); color: #fff; border-radius: 4px; padding: 3px 4px; }
+.cell .fixed { background: var(--pass); }
+.cell.sel { outline: 2px solid var(--accent); outline-offset: 1px; }
+@keyframes ring { 0%, 100% { opacity: .25; } 50% { opacity: 1; } }
+
+/* --- signatures -------------------------------------------------------- */
+.sigs { display: grid; gap: 10px; padding: 0 14px 14px; }
+.sig { border: 1px solid var(--line); border-left: 4px solid var(--fail); border-radius: 10px; padding: 12px 14px; background: var(--panel-2); display: grid; gap: 8px; min-width: 0; }
+.sig.known { border-left-color: var(--warn); }
+.sig.harness { border-left-color: var(--err); }
+.sig h3 { margin: 0; font-size: 14px; line-height: 1.3; }
+.sig p { margin: 0; color: var(--muted); font-size: 12.5px; }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.chip { font: 500 11px/1 var(--f-mono); border-radius: 5px; padding: 4px 6px; background: var(--idle-bg); color: var(--muted); }
+.chip.red { background: var(--fail-bg); color: var(--fail); }
+.chip.amber { background: var(--warn-bg); color: var(--warn); }
+.chip.violet { background: var(--err-bg); color: var(--err); }
+.chip.link { cursor: pointer; border: 0; }
+.chip.link:hover { color: var(--fg); }
+.cite { font: 400 12px/1.45 var(--f-mono); background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 7px 9px; overflow-x: auto; white-space: pre; }
+.cite b { color: var(--accent); font-weight: 500; }
+.empty { padding: 4px 18px 18px; color: var(--muted); }
+
+/* --- checks ------------------------------------------------------------ */
+.checks { display: grid; gap: 12px; padding: 4px 18px 18px; }
+.chk { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 4px 12px; align-items: center; }
+.chk .bar { grid-column: 1 / -1; height: 6px; background: var(--fail-bg); border-radius: 3px; overflow: hidden; }
+.chk .bar i { display: block; height: 100%; background: var(--pass); }
+.chk .n { font-family: var(--f-mono); font-size: 12.5px; color: var(--muted); }
+
+.changes { padding: 0 18px 16px; display: grid; gap: 6px; font-size: 13px; }
+.changes li { list-style: none; display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+.changes ul { margin: 0; padding: 0; display: grid; gap: 6px; }
+
+/* --- drawer ------------------------------------------------------------ */
+.scrim { position: fixed; inset: 0; background: rgba(3,10,18,.5); z-index: 20; }
+.drawer { position: fixed; top: 0; right: 0; bottom: 0; width: min(560px, 100%); background: var(--panel); border-left: 1px solid var(--line); z-index: 21; overflow-y: auto; padding: calc(16px + env(safe-area-inset-top, 0px)) 20px calc(24px + env(safe-area-inset-bottom, 0px)); display: grid; gap: 16px; align-content: start; box-shadow: -20px 0 40px rgba(0,0,0,.3); }
+.drawer h2 { margin: 0; font: 600 19px/1.25 var(--f-body); text-wrap: balance; }
+.drawer section { display: grid; gap: 8px; min-width: 0; }
+.dhead { display: flex; gap: 10px; align-items: flex-start; }
+.dhead > div { flex: 1; min-width: 0; display: grid; gap: 6px; }
+.x { border: 1px solid var(--line); background: var(--panel-2); border-radius: 8px; width: 34px; height: 34px; cursor: pointer; font-size: 18px; line-height: 1; flex: none; }
+.status { display: inline-flex; align-items: center; gap: 6px; font: 600 12px/1 var(--f-mono); letter-spacing: .04em; text-transform: uppercase; border-radius: 6px; padding: 5px 8px; }
+.kv { display: grid; grid-template-columns: minmax(110px, auto) minmax(0, 1fr); gap: 6px 14px; font-size: 13px; margin: 0; }
+.kv dt { color: var(--muted); }
+.kv dd { margin: 0; min-width: 0; overflow-wrap: anywhere; font-family: var(--f-mono); font-size: 12.5px; }
+.clist { display: grid; gap: 6px; margin: 0; padding: 0; }
+.clist li { list-style: none; display: grid; grid-template-columns: 22px minmax(0, 1fr); gap: 2px 8px; font-size: 13px; }
+.clist li span:last-child { grid-column: 2; color: var(--muted); font-family: var(--f-mono); font-size: 12px; overflow-wrap: anywhere; }
+.files { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+.files td { padding: 5px 4px; border-top: 1px solid var(--line); }
+.files td:nth-child(2), .files td:nth-child(3) { font-family: var(--f-mono); color: var(--muted); text-align: right; white-space: nowrap; }
+.foot { color: var(--faint); font-size: 12px; display: flex; flex-wrap: wrap; gap: 6px 18px; }
+
+@media (max-width: 1100px) { .main { grid-template-columns: minmax(0, 1fr); } .tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 560px) { .wrap { padding-inline: 16px; } .tiles { grid-template-columns: minmax(0, 1fr); } .field select { min-width: 0; width: 100%; } .field { flex: 1 1 100%; } .big { font-size: 34px; } }
+@media (prefers-reduced-motion: reduce) { *, *::after { animation: none !important; transition: none !important; } }
+</style>
+<!--KESTREL_DATA-->
+
+<div class="wrap">
+  <header class="top">
+    <div class="brand">
+      <svg viewBox="0 0 48 48" aria-hidden="true">
+        <path d="M6 30 L22 8 L27 20 L42 14 L30 26 L36 40 L22 30 Z" fill="var(--accent)" opacity=".9"/>
+        <path d="M22 8 L27 20 L22 30 L6 30 Z" fill="var(--fg)" opacity=".18"/>
+        <circle cx="24.5" cy="15.5" r="1.6" fill="var(--bg)"/>
+      </svg>
+      <div><b>KESTREL <span>QA</span></b><small>Release qualification for Linux agents · Falco packages</small></div>
+    </div>
+    <label class="field" for="version"><span class="label">Release</span><select id="version"></select></label>
+    <span class="pill" id="mode"><span class="dot"></span><span id="modeText">Loading</span></span>
+    <a class="btn" id="export" href="/export" hidden>Export snapshot</a>
+  </header>
+
+  <section class="tiles" aria-label="Summary">
+    <div class="tile verdict" id="tVerdict"><span class="label">Gate verdict</span><span class="big" id="vBig">–</span><span class="sub" id="vSub"></span></div>
+    <div class="tile"><span class="label">Cells</span><span class="big" id="cBig">–</span><div class="stack" id="cStack"></div><span class="sub" id="cSub"></span></div>
+    <div class="tile"><span class="label">Distinct failures</span><span class="big" id="fBig">–</span><span class="sub" id="fSub"></span></div>
+    <div class="tile"><span class="label">Evidence bundles</span><span class="big" id="eBig">–</span><span class="sub" id="eSub"></span></div>
+  </section>
+
+  <div class="main">
+    <div class="col">
+      <section class="panel" aria-labelledby="gridTitle">
+        <header>
+          <h2 id="gridTitle">Qualification grid</h2>
+          <div class="legend">
+            <span><i class="s-pass"></i>Pass</span><span><i class="s-fail"></i>Fail</span>
+            <span><i class="s-unsupported"></i>Kernel can't run it</span><span><i class="s-blocked"></i>Blocked</span>
+            <span><i class="s-error"></i>Harness error</span><span><i class="s-running"></i>Running</span>
+          </div>
+          <p>Each cell is one real VM: the release's .deb or .rpm installed through the package manager, maintainer scripts and all. NEW marks a cell that is red now and was not red in the previous release.</p>
+        </header>
+        <div class="gridwrap"><table class="grid" id="grid"></table></div>
+      </section>
+
+      <section class="panel" aria-labelledby="chkTitle">
+        <header><h2 id="chkTitle">Deterministic checks</h2><p>Decided by code from what each guest reported. Cells the harness could not judge are not counted.</p></header>
+        <div class="checks" id="checks"></div>
+      </section>
+    </div>
+
+    <div class="col">
+      <section class="panel" aria-labelledby="sigTitle">
+        <header><h2 id="sigTitle">Failure signatures</h2><p>Red cells grouped by the line their own evidence matched. One signature is one failure, however many cells it reddens.</p></header>
+        <div class="sigs" id="sigs"></div>
+      </section>
+      <section class="panel" aria-labelledby="chgTitle">
+        <header><h2 id="chgTitle">Changes</h2><p id="chgSub"></p></header>
+        <div class="changes" id="changes"></div>
+      </section>
+    </div>
+  </div>
+
+  <footer class="foot" id="foot"></footer>
+</div>
+
+<div class="scrim" id="scrim" hidden></div>
+<aside class="drawer" id="drawer" hidden aria-label="Cell detail"></aside>
+
+<script>
+(() => {
+  const $ = (id) => document.getElementById(id);
+  const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+  const SNAP = window.KESTREL_SNAPSHOT || null;
+  const LIVE = !SNAP;
+  let state = SNAP, version = null, openCell = null, lastFetch = 0;
+
+  const DISTRO = { ubuntu: "Ubuntu", debian: "Debian", rocky: "Rocky", almalinux: "AlmaLinux", fedora: "Fedora", centos: "CentOS" };
+  const distroName = (d) => { const [f, ...v] = d.split("-"); return `${DISTRO[f] || f} ${v.join("-")}`; };
+  const kernelName = (k) => k.replace(/-hwe$/, " HWE");
+  const SCEN = {
+    "fresh-auto": ["Fresh install", "driver: auto"], "fresh-kmod": ["Fresh install", "driver: kmod"],
+    "fresh-modern_ebpf": ["Fresh install", "driver: modern eBPF"], "upgrade": ["Upgrade", "in place"],
+  };
+  const scenName = (s, from) => { const [a, b] = SCEN[s] || [s, ""]; return [a, s === "upgrade" && from ? `from ${from}` : b]; };
+  const CHECK = { pkg_installed: "Package configured", driver_loaded: "Driver in the kernel", service_active: "Service running", event_detected: "Event detected" };
+  const GLYPH = { pass: "✓", fail: "✕", error: "!", unsupported: "–", blocked: "⊘", running: "•", queued: "·", notrun: "·" };
+  const STATUS = { pass: "Pass", fail: "Fail", error: "Harness error", unsupported: "Kernel can't run it", blocked: "Blocked", running: "Running", queued: "Queued", notrun: "Not run" };
+  const DRIVER = { kmod: "kmod", modern_ebpf: "eBPF", ebpf: "legacy eBPF", none: "", unknown: "" };
+  const fmtBytes = (n) => n >= 1048576 ? `${(n / 1048576).toFixed(1)} MB` : n >= 1024 ? `${(n / 1024).toFixed(0)} KB` : `${n} B`;
+  const fmtTime = (iso) => iso ? new Date(iso).toLocaleString(undefined, { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit", timeZoneName: "short" }) : "";
+  const store = { get(k) { try { return localStorage.getItem(k); } catch { return null; } }, set(k, v) { try { localStorage.setItem(k, v); } catch {} } };
+
+  const cellsOf = (v) => state.cells.filter((c) => c.version === v);
+  const keyOf = (c) => `${c.distro}--${c.kernel}--${c.scenario}`;
+  function gateState(v, name) {
+    const g = state.per_version[v]?.gate; if (!g) return null;
+    for (const k of ["new", "known", "fixed"]) { const r = g[k].find((x) => x.cell === name); if (r) return { kind: k, ...r }; }
+    return null;
+  }
+  function firstSeen(sigId) {
+    const vs = state.cells.filter((c) => c.signature?.id === sigId).map((c) => c.version);
+    return state.versions.find((v) => vs.includes(v));
+  }
+
+  // --- rendering -------------------------------------------------------------
+  function render() {
+    if (!state) return;
+    const sel = $("version");
+    if (!version || !state.versions.includes(version)) {
+      const hashV = (location.hash.match(/^#v_(.+)$/) || [])[1];
+      const remembered = store.get("kestrel.version");
+      version = [hashV, remembered].find((v) => v && state.versions.includes(v)) || state.versions[state.versions.length - 1];
+    }
+    sel.innerHTML = state.versions.slice().reverse().map((v) =>
+      `<option value="${esc(v)}"${v === version ? " selected" : ""}>falco ${esc(v)}${state.per_version[v].channel === "dev" ? "  (pre-release)" : ""}</option>`).join("");
+    renderMode(); renderTiles(); renderGrid(); renderChecks(); renderSigs(); renderChanges(); renderFoot();
+    if (openCell) openDrawer(openCell, true);
+  }
+
+  function renderMode() {
+    const pill = $("mode");
+    pill.classList.toggle("live", LIVE);
+    if (LIVE) {
+      const age = Math.max(0, Math.round((Date.now() - lastFetch) / 1000));
+      const run = state.running.length;
+      $("modeText").textContent = `Live · ${run ? run + " running · " : ""}checked ${age}s ago`;
+    } else {
+      $("modeText").textContent = `Snapshot · ${fmtTime(state.generated_at)}`;
+    }
+    $("export").hidden = !LIVE;
+  }
+
+  function renderTiles() {
+    const pv = state.per_version[version], g = pv.gate, counts = pv.counts;
+    const total = state.expected.length || g.cells;
+    const done = Object.values(counts).reduce((a, b) => a + b, 0);
+    const base = pv.baseline.length ? pv.baseline[pv.baseline.length - 1] : null;
+    const t = $("tVerdict"); t.className = "tile verdict";
+    if (g.new.length) {
+      t.classList.add("blocked"); $("vBig").textContent = "BLOCKED";
+      const regressed = g.new.filter((r) => r.baseline_version).length, first = g.new.length - regressed;
+      $("vSub").textContent = [regressed ? `${regressed} turned red since ${base}` : "", first ? `${first} red on ${regressed || g.known.length ? "their " : ""}first run` : "",
+        g.known.length ? `${g.known.length} already red before` : ""].filter(Boolean).join(" · ");
+    } else if (pv.running) {
+      t.classList.add("running"); $("vBig").textContent = "RUNNING";
+      $("vSub").textContent = `${pv.running} cell${pv.running > 1 ? "s" : ""} on VMs now, no new red so far`;
+    } else {
+      t.classList.add("clear"); $("vBig").textContent = "CLEAR";
+      $("vSub").textContent = g.known.length ? `No new red. ${g.known.length} red cells already known in ${base}.` : "No red cells.";
+    }
+    $("cBig").innerHTML = `${counts.pass || 0}<span class="muted" style="font-size:.55em"> / ${done} passed</span>`;
+    const order = [["pass", "--pass"], ["unsupported", "--warn"], ["blocked", "--idle"], ["fail", "--fail"], ["error", "--err"]];
+    $("cStack").innerHTML = order.map(([k, c]) => counts[k] ? `<i style="width:${(counts[k] / Math.max(total, done)) * 100}%;background:var(${c})" title="${STATUS[k]}: ${counts[k]}"></i>` : "").join("")
+      + (pv.running ? `<i style="width:${pv.running / Math.max(total, done) * 100}%;background:var(--accent)" title="Running: ${pv.running}"></i>` : "");
+    const parts = order.filter(([k]) => counts[k] && k !== "pass").map(([k]) => `${counts[k]} ${STATUS[k].toLowerCase()}`);
+    const missing = Math.max(0, total - done - pv.running);
+    $("cSub").textContent = [parts.join(", "), missing ? `${missing} of ${total} not run` : ""].filter(Boolean).join(" · ") || "Every cell passed";
+    const groups = pv.groups;
+    const redCells = groups.reduce((a, gr) => a + gr.cells.length, 0);
+    $("fBig").textContent = groups.length;
+    $("fSub").textContent = groups.length ? `behind ${redCells} red cells · ${groups.filter((gr) => gr.new_count).length} new in this release` : "No red cells";
+    const vc = cellsOf(version), bundles = vc.filter((c) => c.evidence.length);
+    const files = bundles.reduce((a, c) => a + c.evidence.length, 0);
+    $("eBig").textContent = bundles.length;
+    $("eSub").textContent = `${files} files, each with a sha256 in its manifest`;
+  }
+
+  function cellAt(t, s) {
+    const name = `${t.distro}--${t.kernel}--${s}`;
+    const c = state.cells.find((x) => x.version === version && x.cell === name);
+    if (c) return { status: c.status, c, name };
+    const r = state.running.find((x) => x.version === version && x.cell === name);
+    if (r) return { status: "running", r, name };
+    const expected = state.expected.includes(name);
+    return { status: expected && state.per_version[version].running ? "queued" : "notrun", name };
+  }
+
+  function renderGrid() {
+    const from = cellsOf(version).find((c) => c.upgrade_from)?.upgrade_from;
+    const head = `<tr><th></th>${state.scenarios.map((s) => { const [a, b] = scenName(s, from); return `<th scope="col">${esc(a)}<small>${esc(b)}</small></th>`; }).join("")}</tr>`;
+    const rows = state.targets.map((t) => {
+      const any = state.scenarios.some((s) => cellAt(t, s).status !== "notrun");
+      if (!any && !state.expected.some((n) => n.startsWith(`${t.distro}--${t.kernel}--`))) return "";
+      return `<tr><th class="row" scope="row">${esc(distroName(t.distro))}<small>${esc(kernelName(t.kernel))}</small></th>${state.scenarios.map((s) => {
+        const x = cellAt(t, s);
+        const gs = x.c ? gateState(version, x.name) : null;
+        const tag = gs?.kind === "new" ? `<span class="new">NEW</span>` : gs?.kind === "fixed" ? `<span class="new fixed">FIXED</span>` : "";
+        const drv = x.c && x.c.status === "pass" ? DRIVER[x.c.driver] || "" : x.status === "running" ? x.r.phase : "";
+        const tip = x.c ? `${STATUS[x.status]}${x.c.reason ? ": " + x.c.reason : ""}` : x.r ? `Running: ${x.r.phase}` : STATUS[x.status];
+        const click = x.c ? ` data-cell="${esc(x.name)}" tabindex="0" role="button"` : "";
+        return `<td><div class="cell s-${x.status}${openCell === x.name ? " sel" : ""}"${click} title="${esc(tip)}" aria-label="${esc(distroName(t.distro) + " " + kernelName(t.kernel) + ", " + s + ": " + tip)}">${tag}<span class="g">${GLYPH[x.status]}</span>${drv ? `<span class="d">${esc(drv)}</span>` : ""}</div></td>`;
+      }).join("")}</tr>`;
+    }).join("");
+    $("grid").innerHTML = `<colgroup><col class="rowcol">${state.scenarios.map(() => "<col>").join("")}</colgroup><thead>${head}</thead><tbody>${rows}</tbody>`;
+  }
+
+  function renderChecks() {
+    $("checks").innerHTML = state.per_version[version].checks.map((k) => {
+      const pct = k.ran ? (k.passed / k.ran) * 100 : 0;
+      return `<div class="chk"><span>${esc(CHECK[k.name] || k.name)} <span class="muted mono" style="font-size:11.5px">${esc(k.name)}</span></span><span class="n">${k.passed} / ${k.ran}</span><div class="bar"><i style="width:${pct}%"></i></div></div>`;
+    }).join("") || `<p class="empty">No judged cells yet.</p>`;
+  }
+
+  function renderSigs() {
+    const groups = state.per_version[version].groups;
+    if (!groups.length) { $("sigs").innerHTML = `<p class="empty">No red cells in this release.</p>`; return; }
+    $("sigs").innerHTML = groups.map((g) => {
+      const harness = g.cells.some((n) => state.cells.find((c) => c.version === version && c.cell === n)?.status === "error");
+      const seen = firstSeen(g.id);
+      const cls = harness ? "harness" : g.new_count ? "" : "known";
+      const badge = g.new_count ? `<span class="chip red">${g.new_count} new</span>` : `<span class="chip amber">known since ${esc(seen || g.known_since || "earlier")}</span>`;
+      const cells = g.cells.map((n) => { const [d, k, s] = n.split("--"); return `<button class="chip link" data-cell="${esc(n)}">${esc(distroName(d))} ${esc(kernelName(k))} · ${esc(s)}</button>`; }).join("");
+      const cite = g.file ? `<div class="cite"><b>${esc(g.file)}:${g.line}</b>  ${esc(g.text)}</div>` : "";
+      const known = g.known ? ` <a href="${esc(g.known)}" target="_blank" rel="noopener">${esc(g.known.replace("https://github.com/", "").replace("/issues/", "#"))}</a>` : "";
+      return `<article class="sig ${cls}"><div class="chips">${badge}<span class="chip">${g.cells.length} cell${g.cells.length > 1 ? "s" : ""}</span>${harness ? `<span class="chip violet">harness</span>` : ""}</div><h3>${esc(g.title)}</h3><p>${esc(g.summary)}${known}</p>${cite}<div class="chips">${cells}</div></article>`;
+    }).join("");
+  }
+
+  function renderChanges() {
+    const pv = state.per_version[version], g = pv.gate;
+    const base = pv.baseline.join(", ");
+    $("chgSub").textContent = base ? `Compared cell by cell with the newest earlier release that ran it (${base}).` : "No earlier release ran these cells, so every red cell counts as new.";
+    const li = (r, kind) => { const [d, k, s] = r.cell.split("--"); const was = r.baseline_status ? `was ${r.baseline_status} in ${r.baseline_version}` : "first run"; return `<li><span class="chip ${kind === "fixed" ? "" : "red"}">${kind}</span><button class="chip link" data-cell="${esc(r.cell)}">${esc(distroName(d))} ${esc(kernelName(k))} · ${esc(s)}</button><span class="muted">${esc(was)}</span></li>`; };
+    const items = [...g.new.map((r) => li(r, "new")), ...g.fixed.map((r) => li(r, "fixed"))];
+    $("changes").innerHTML = items.length ? `<ul>${items.join("")}</ul>` : `<p class="muted" style="margin:0">No cell changed colour. ${g.known.length} red cells are the same ones as before.</p>`;
+  }
+
+  function renderFoot() {
+    const vc = cellsOf(version), shas = [...new Set(vc.map((c) => c.git_sha).filter(Boolean))];
+    $("foot").innerHTML = `<span>Data ${LIVE ? "read live from" : "frozen from"} kernel-matrix results/qualification</span><span>Harness ${shas.map((s) => `<span class="mono">${esc(s.slice(0, 7))}</span>`).join(", ") || "unknown"}</span><span>Not affiliated with the Falco project or the Cloud Native Computing Foundation.</span>`;
+  }
+
+  // --- drawer ----------------------------------------------------------------
+  function openDrawer(name, keepScroll) {
+    const c = state.cells.find((x) => x.version === version && x.cell === name);
+    if (!c) { closeDrawer(); return; }
+    openCell = name;
+    const d = $("drawer"), top = keepScroll ? d.scrollTop : 0;
+    const gs = gateState(version, name);
+    const [sa, sb] = scenName(c.scenario, c.upgrade_from);
+    const pk = c.package || {}, sn = c.sensor || {};
+    const gateLine = gs ? (gs.kind === "new" ? `New red in ${esc(version)}${gs.baseline_status ? `: ${esc(gs.baseline_status)} in ${esc(gs.baseline_version)}` : ": no earlier result"}`
+      : gs.kind === "known" ? `Known: red in ${esc(gs.baseline_version)} too` : `Fixed: ${esc(gs.baseline_status)} in ${esc(gs.baseline_version)}`) : "";
+    const checks = c.checks.length ? `<ul class="clist">${c.checks.map((k) => `<li><span style="color:var(${k.passed ? "--pass" : "--fail"})">${k.passed ? "✓" : "✕"}</span><span>${esc(CHECK[k.name] || k.name)}</span><span>${esc(k.observed)}</span></li>`).join("")}</ul>` : `<p class="muted" style="margin:0">Not judged: ${esc(c.reason)}</p>`;
+    const sig = c.signature;
+    const sigHtml = sig ? `<section><span class="label">Failure signature</span><div class="sig ${gs?.kind === "known" ? "known" : ""}"><h3>${esc(sig.title)}</h3><p>${esc(sig.summary)}${sig.known ? ` <a href="${esc(sig.known)}" target="_blank" rel="noopener">${esc(sig.known.replace("https://github.com/", "").replace("/issues/", "#"))}</a>` : ""}</p>${c.key_lines.length ? `<div class="cite">${c.key_lines.map((l) => (l.match ? `<b>${esc(l.file)}:${l.line}</b> ` : `${esc(l.file)}:${l.line} `) + esc(l.text)).join("\n")}</div>` : ""}</div></section>` : "";
+    const link = (f) => LIVE ? `<a href="/evidence/${encodeURIComponent(version)}/${encodeURIComponent(name)}/${encodeURIComponent(f)}" target="_blank" rel="noopener">${esc(f)}</a>` : esc(f);
+    const files = c.evidence.length ? `<table class="files"><tbody>${c.evidence.map((f) => `<tr><td>${link(f.name)}</td><td>${fmtBytes(f.bytes)}</td><td title="${esc(f.sha256)}">${esc(f.sha256.slice(0, 12))}</td></tr>`).join("")}${LIVE ? `<tr><td>${link("console.log")}</td><td></td><td>run console</td></tr><tr><td>${link("manifest.json")}</td><td></td><td>hashes</td></tr>` : ""}</tbody></table>` : `<p class="muted" style="margin:0">No bundle: the run stopped before evidence collection.</p>`;
+    const rows = [
+      ["Kernel", c.kernel_observed], ["Driver", c.driver], ["Modern eBPF capable", c.modern_ebpf_capable == null ? "" : c.modern_ebpf_capable ? "yes" : "no"],
+      ["Secure Boot", c.secure_boot == null ? "" : c.secure_boot ? "enforced" : "off"],
+      ["Package", pk.url ? `<a href="${esc(pk.url)}" target="_blank" rel="noopener">${esc(pk.url.split("/").pop())}</a>` : ""],
+      ["sha256", pk.sha256], ["Installed", [pk.installed_version, pk.state].filter(Boolean).join(" · ")], ["Package manager exit", pk.exit],
+      ["Upgraded from", pk.base_version ? `${pk.base_version} (${pk.base_state})` : ""], ["Build tools", c.prereqs],
+      ["Sensor at idle", sn.rss_kb ? `${(sn.rss_kb / 1024).toFixed(0)} MB RSS · ${sn.cpu_percent}% CPU` : ""],
+      ["Alert after", sn.detect_seconds && c.status === "pass" ? `${sn.detect_seconds}s · ${sn.rule_matched}` : ""],
+      ["Degraded", sn.bpf_load_errors ? `${sn.bpf_load_errors} BPF programs failed to load` : ""],
+      ["Ran", `${fmtTime(c.started_at)} · ${Math.round((c.duration_s || 0) / 60)} min`], ["Harness", c.git_sha ? c.git_sha.slice(0, 10) : ""],
+    ].filter(([, v]) => v !== "" && v != null);
+    d.innerHTML = `<div class="dhead"><div><span class="label">falco ${esc(version)} · ${esc(c.channel === "dev" ? "pre-release" : "stable")}</span><h2>${esc(distroName(c.distro))} ${esc(kernelName(c.kernel))} · ${esc(sa)} <span class="muted">${esc(sb)}</span></h2><div><span class="status s-${c.status}">${GLYPH[c.status]} ${esc(STATUS[c.status])}</span></div>${c.reason ? `<span class="muted mono" style="font-size:12.5px">${esc(c.reason)}</span>` : ""}${gateLine ? `<span style="font-size:13px">${gateLine}</span>` : ""}</div><button class="x" id="close" aria-label="Close">×</button></div>
+      <section><span class="label">Checks</span>${checks}</section>${sigHtml}
+      <section><span class="label">Run</span><dl class="kv">${rows.map(([k, v]) => `<dt>${esc(k)}</dt><dd>${typeof v === "string" && v.startsWith("<a ") ? v : esc(v)}</dd>`).join("")}</dl></section>
+      <section><span class="label">Evidence bundle${LIVE ? "" : " (file list; open the live dashboard for contents)"}</span>${files}</section>`;
+    d.hidden = false; $("scrim").hidden = false; d.scrollTop = top;
+    $("close").onclick = closeDrawer;
+    document.querySelectorAll(".cell.sel").forEach((e) => e.classList.remove("sel"));
+    document.querySelectorAll(`.cell[data-cell="${CSS.escape(name)}"]`).forEach((e) => e.classList.add("sel"));
+    if (!keepScroll) { history.replaceState(null, "", `#c_${version}__${name}`); $("close").focus(); }
+  }
+  function closeDrawer() {
+    openCell = null; $("drawer").hidden = true; $("scrim").hidden = true;
+    document.querySelectorAll(".cell.sel").forEach((e) => e.classList.remove("sel"));
+    history.replaceState(null, "", `#v_${version}`);
+  }
+
+  // --- events ----------------------------------------------------------------
+  document.addEventListener("click", (e) => { const t = e.target.closest("[data-cell]"); if (t) openDrawer(t.dataset.cell); });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && openCell) closeDrawer();
+    if ((e.key === "Enter" || e.key === " ") && e.target.matches?.(".cell[data-cell]")) { e.preventDefault(); openDrawer(e.target.dataset.cell); }
+  });
+  $("scrim").onclick = closeDrawer;
+  $("version").onchange = (e) => { version = e.target.value; store.set("kestrel.version", version); closeDrawer(); render(); };
+
+  function boot() {
+    const m = location.hash.match(/^#c_(.+?)__(.+)$/);
+    if (m && state.versions.includes(m[1])) { version = m[1]; openCell = m[2]; }
+    render();
+  }
+
+  if (LIVE) {
+    const poll = async () => {
+      try {
+        const r = await fetch(`/api/state${state ? `?since=${state.fingerprint}` : ""}`, { cache: "no-store" });
+        const j = await r.json(); lastFetch = Date.now();
+        if (!j.unchanged) { const first = !state; state = j; try { first ? boot() : render(); } catch (err) { console.error("render failed", err); } }
+        else renderMode();
+      } catch (err) { $("modeText").textContent = "Live · server unreachable, retrying"; }
+      setTimeout(poll, state && state.running.length ? 3000 : 6000);
+    };
+    poll();
+    setInterval(() => state && renderMode(), 1000);
+  } else {
+    boot();
+  }
+})();
+</script>

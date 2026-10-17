@@ -255,6 +255,26 @@ before and red now is `new` and fails it; red before and green now is `fixed`. T
 is written to `results/qualification/<version>/gate.json` and archived with the grid.
 Build with `VERSIONS=0.45.1-rc1` to re-run a named version.
 
+### Kestrel QA, the live view
+
+`dashboard/server.py` serves the qualification grids on port 8099 (a systemd user service
+on hardac2, see `dashboard/kestrel-qa.service`). It reads `results/qualification/` on every
+poll, so a run fills the grid in as each VM finishes, and a cell on a VM right now shows
+what it is doing (booting, switching kernel, installing Falco). No database: the files
+qualify.py writes are the state.
+
+| Panel | Comes from |
+|---|---|
+| Gate verdict | `qualify.gate()`: red cells that are new against the newest earlier version that ran the same cell |
+| Qualification grid | one cell JSON per target x scenario; planned cells with no result show as queued or not run |
+| Failure signatures | each red cell's own evidence matched against known patterns, citing file and line; cells with the same signature are one failure |
+| Deterministic checks | the four checks rolled up across judged cells |
+| Cell drawer | checks, package sha256, kernel, Secure Boot, idle cost, and the evidence files from the manifest |
+
+The evidence route serves only files a cell's manifest lists. **Export snapshot** (or
+`python3 dashboard/server.py --export kestrel.html`) freezes the current state into one
+self-contained page for sharing; it keeps the file list and hashes, plus the cited lines.
+
 ---
 
 ## Layout
@@ -276,6 +296,7 @@ push_metrics.py      results.json -> Prometheus Pushgateway
 xray_import.py       JUnit -> Jira/Xray, one environment per kernel
 Jenkinsfile          preflight -> lint -> parallel matrix -> publish
 Jenkinsfile.qualify  nightly: discover new Falco RCs -> qualify -> gate on new red cells
+dashboard/           Kestrel QA: live qualification dashboard (server.py, kestrel.html, service unit)
 observability/       docker compose: Prometheus, Grafana, Pushgateway, nginx
 ```
 

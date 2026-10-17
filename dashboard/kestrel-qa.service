@@ -1,0 +1,20 @@
+# Kestrel QA dashboard, as a systemd --user service on the lab host.
+#
+#   install -D -m 0644 dashboard/kestrel-qa.service ~/.config/systemd/user/kestrel-qa.service
+#   systemctl --user daemon-reload && systemctl --user enable --now kestrel-qa
+#   loginctl enable-linger $USER      # keep it running with nobody logged in
+#
+# It reads results/qualification/ from this checkout. To follow the Jenkins
+# job's grids instead, add --results <workspace>/results/qualification.
+[Unit]
+Description=Kestrel QA dashboard (Falco package qualification)
+After=network-online.target
+
+[Service]
+WorkingDirectory=%h/kernel-matrix
+ExecStart=/usr/bin/python3 %h/kernel-matrix/dashboard/server.py --port 8099
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
