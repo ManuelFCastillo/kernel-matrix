@@ -831,3 +831,47 @@ def test_serve_build_starts_once_for_a_branch_build_and_never_for_a_release(monk
     assert calls == []
     qualify.serve_build(qual, FIX)
     assert calls == [("build", FIX), ("serve",)]
+
+
+FULL = ROOT / "patches" / "fix-postinst-modern-ebpf.patch"
+
+
+def full_patch_blocks():
+    sys.path.insert(0, str(ROOT))
+    import apply_script_patch
+    groups = apply_script_patch.hunks(FULL.read_text())
+    return {path: [old for old, _ in g] for path, g in groups.items()}
+
+
+def test_full_patch_has_one_group_per_source_file():
+    assert set(full_patch_blocks()) == {"scripts/packaging/functions.sh.in",
+                                        "scripts/debian/postinst.in", "scripts/rpm/postinstall.in"}
+
+
+def test_multi_file_patch_fixes_each_deb_script_with_its_own_hunks(tmp_path):
+    blocks = full_patch_blocks()
+    fn, deb_post = blocks["scripts/packaging/functions.sh.in"][0], blocks["scripts/debian/postinst.in"][0]
+    postinst, prerm = tmp_path / "postinst", tmp_path / "prerm"
+    postinst.write_text(f"#!/bin/sh\n{fn}\n{deb_post}")
+    prerm.write_text(f"#!/bin/sh\n{fn}")
+    # The rpm hunk has nothing to match in a deb: with --format deb it is not expected.
+    subprocess.run([sys.executable, str(APPLY), "--format", "deb", str(FULL), str(postinst), str(prerm)],
+                   check=True)
+    assert "|| driver_env=" in postinst.read_text() and "|| driver_env=" in prerm.read_text()
+    assert '--type "$chosen_driver" || true' in postinst.read_text()
+    assert "|| true" not in prerm.read_text()
+
+
+def test_multi_file_patch_requires_the_formats_own_hunks(tmp_path):
+    blocks = full_patch_blocks()
+    fn, rpm_post = blocks["scripts/packaging/functions.sh.in"][0], blocks["scripts/rpm/postinstall.in"][0]
+    # An rpm spec: functions embedded twice (%-escaped by rpmrebuild), %post once.
+    esc = fn.replace("%", "%%")
+    spec = f"%pre\n{esc}\n%post\n{esc}\n{rpm_post}"
+    out = subprocess.run([sys.executable, str(APPLY), "--format", "rpm", str(FULL), "-"],
+                         input=spec, capture_output=True, text=True, check=True).stdout
+    assert out.count("|| driver_env=") == 2 and '--type "$chosen_driver" || true' in out
+    # Without its %post block the rpm build would ship half the fix: refuse.
+    half = subprocess.run([sys.executable, str(APPLY), "--format", "rpm", str(FULL), "-"],
+                          input=f"%post\n{fn.replace('%', '%%')}\n", capture_output=True, text=True)
+    assert half.returncode != 0 and "scripts/rpm/postinstall.in" in half.stderr

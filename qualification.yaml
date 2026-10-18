@@ -98,3 +98,12 @@ builds:
       falco#3994 fix: guard the bare `falcoctl driver printenv` in
       package_driver_version (branch fix/postinst-printenv-without-modern-ebpf,
       off master 066991c, not yet merged), applied to the 0.45.1-rc1 packages.
+  0.45.1-rc1+fix-postinst-modern-ebpf:
+    base: 0.45.1-rc1
+    patch: patches/fix-postinst-modern-ebpf.patch
+    source: >-
+      The whole falco#3994 fix as committed (6893896d on branch
+      fix/postinst-printenv-without-modern-ebpf, off master 066991c, not yet
+      submitted): the guarded printenv above, plus `|| true` on
+      `falcoctl driver config` in the deb postinst and rpm %post so a kernel
+      that cannot run the chosen driver no longer aborts the install.

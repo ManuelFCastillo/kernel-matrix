@@ -1,0 +1,46 @@
+diff --git a/scripts/debian/postinst.in b/scripts/debian/postinst.in
+index 02398c56..a939a077 100755
+--- a/scripts/debian/postinst.in
++++ b/scripts/debian/postinst.in
+@@ -83,7 +83,9 @@ if [ "$1" = "configure" ]; then
+                 # Load the actually automatic chosen driver
+                 chosen_driver=$(falcoctl driver printenv | grep DRIVER= | cut -d'"' -f2)
+             else
+-                falcoctl driver config --version "$driver_version" --type "$chosen_driver"
++                # Under set -e this must not abort the install when the kernel
++                # cannot run the chosen driver; its service then fails to start.
++                falcoctl driver config --version "$driver_version" --type "$chosen_driver" || true
+             fi
+             CHOICE=
+             case $FALCOCTL_ENABLED in
+diff --git a/scripts/packaging/functions.sh.in b/scripts/packaging/functions.sh.in
+index a3218cda..871580d7 100644
+--- a/scripts/packaging/functions.sh.in
++++ b/scripts/packaging/functions.sh.in
+@@ -33,7 +33,10 @@ package_save_previous_driver() {
+ }
+ 
+ package_driver_version() {
+-    driver_env=$(falcoctl driver printenv)
++    # This runs before the driver types are reconfigured. The shipped config
++    # allows only modern_ebpf, so printenv fails on kernels that cannot run it;
++    # an empty result falls back to the package driver version below.
++    driver_env=$(falcoctl driver printenv 2>/dev/null) || driver_env=
+     driver_version=$(printf '%s\n' "$driver_env" | sed -n 's/^DRIVER_VERSION="\([^"]*\)"$/\1/p')
+     # RPM replaces the old configuration before %post; retain its driver pin.
+     if [ "${package_format:-}" = rpm ] && [ -s "$package_state/previous-version" ]; then
+diff --git a/scripts/rpm/postinstall.in b/scripts/rpm/postinstall.in
+index ff37cd57..77c4d5f2 100755
+--- a/scripts/rpm/postinstall.in
++++ b/scripts/rpm/postinstall.in
+@@ -83,7 +83,9 @@ if [ $1 -ge 1 ]; then
+                 # Load the actually automatic chosen driver
+                 chosen_driver=$(falcoctl driver printenv | grep DRIVER= | cut -d'"' -f2)
+             else
+-                falcoctl driver config --version "$driver_version" --type "$chosen_driver"
++                # Under set -e this must not abort the install when the kernel
++                # cannot run the chosen driver; its service then fails to start.
++                falcoctl driver config --version "$driver_version" --type "$chosen_driver" || true
+             fi
+             CHOICE=
+             case $FALCOCTL_ENABLED in

@@ -71,7 +71,7 @@ tar -C "$work/deb/control" -xf "$work/deb/$control"
 tar -C "$work/deb/control.orig" -xf "$work/deb/$control"
 order=$(tar -tf "$work/deb/$control")
 scripts=$(cd "$work/deb/control" && ls preinst postinst prerm postrm 2>/dev/null)
-( cd "$work/deb/control" && python3 "$work/apply_script_patch.py" "$work/fix.patch" $scripts )
+( cd "$work/deb/control" && python3 "$work/apply_script_patch.py" --format deb "$work/fix.patch" $scripts )
 # Same member order, root ownership and modes as the original.
 tar -C "$work/deb/control" --owner=0 --group=0 --numeric-owner --no-recursion \
     "${comp[@]}" -cf "$work/deb/new-$control" $order
@@ -90,7 +90,7 @@ echo "== rpm: rpmrebuild in $IMAGE with the scriptlets patched"
 docker run --rm -v "$work:/w" "$IMAGE" bash -euc '
     dnf -y -q install rpmrebuild python3 cpio >/dev/null
     rpmrebuild --package --notest-install --directory=/w/rpmout \
-        --change-spec-whole="python3 /w/apply_script_patch.py /w/fix.patch -" /w/base.rpm
+        --change-spec-whole="python3 /w/apply_script_patch.py --format rpm /w/fix.patch -" /w/base.rpm
     out=$(find /w/rpmout -name "*.rpm" | head -1)
     cp "$out" /w/out.rpm
     rpm -qp --scripts /w/base.rpm > /w/rpm.scripts.old
