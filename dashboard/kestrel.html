@@ -109,7 +109,7 @@ table.grid { border-collapse: separate; border-spacing: 6px; width: 100%; min-wi
 .s-unsupported { background: var(--warn-bg); color: var(--warn); }
 .s-blocked { background: var(--idle-bg); color: var(--idle); }
 .s-running { background: var(--accent-bg); color: var(--accent); }
-.s-running::after { content: ""; position: absolute; inset: -1px; border-radius: 8px; border: 1px solid var(--accent); animation: ring 1.6s ease-in-out infinite; }
+.cell.s-running::after { content: ""; position: absolute; inset: -1px; border-radius: 8px; border: 1px solid var(--accent); animation: ring 1.6s ease-in-out infinite; }
 .s-queued, .s-notrun { background: transparent; border: 1px dashed var(--line); color: var(--faint); cursor: default; }
 .cell .new { position: absolute; top: -7px; right: -5px; font: 600 9px/1 var(--f-mono); letter-spacing: .06em; background: var(--fail); color: #fff; border-radius: 4px; padding: 3px 4px; }
 .cell .fixed { background: var(--pass); }
@@ -277,8 +277,12 @@ table.grid { border-collapse: separate; border-spacing: 6px; width: 100%; min-wi
       const remembered = store.get("kestrel.version");
       version = [hashV, remembered].find((v) => v && state.versions.includes(v)) || state.versions[state.versions.length - 1];
     }
-    sel.innerHTML = state.versions.slice().reverse().map((v) =>
-      `<option value="${esc(v)}"${v === version ? " selected" : ""}>falco ${esc(v)}${state.per_version[v].channel === "dev" ? "  (pre-release)" : ""}</option>`).join("");
+    // Rebuild the options only when the release list changes: live polls
+    // re-render every few seconds and would close an open dropdown.
+    const opts = state.versions.slice().reverse().map((v) =>
+      `<option value="${esc(v)}">falco ${esc(v)}${state.per_version[v].channel === "dev" ? "  (pre-release)" : ""}</option>`).join("");
+    if (sel.dataset.opts !== opts) { sel.innerHTML = opts; sel.dataset.opts = opts; }
+    if (sel.value !== version) sel.value = version;
     renderMode(); renderTiles(); renderGrid(); renderChecks(); renderSigs(); renderChanges(); renderFoot();
     if (openCell) openDrawer(openCell, true);
   }
@@ -447,6 +451,10 @@ table.grid { border-collapse: separate; border-spacing: 6px; width: 100%; min-wi
   });
   $("scrim").onclick = closeDrawer;
   $("version").onchange = (e) => { version = e.target.value; store.set("kestrel.version", version); closeDrawer(); render(); };
+  window.addEventListener("hashchange", () => {
+    const v = (location.hash.match(/^#v_(.+)$/) || [])[1];
+    if (state && v && v !== version && state.versions.includes(v)) { version = v; closeDrawer(); render(); }
+  });
 
   function boot() {
     const m = location.hash.match(/^#c_(.+?)__(.+)$/);
