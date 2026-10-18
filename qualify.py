@@ -31,6 +31,7 @@ USAGE
     ./qualify.py --matrix-only                     # rebuild matrix.json from cell results
     ./qualify.py --discover                        # release candidates not yet qualified
     ./qualify.py --gate 0.45.1-rc1                 # exit 1 only on red cells that are new
+    ./qualify.py --version 0.45.1-rc1+fix-postinst-printenv   # a branch build (see BRANCH BUILDS)
 
 At most --max-vms VMs run at once (default 4), counting VMs this script did
 not start: hardac2's RAM is shared with other work.
@@ -51,16 +52,34 @@ version, the job qualifies each one, and --gate turns the grid into a build
 result. A red cell that was already red for the same distro, kernel and
 scenario in an earlier version is known (falco#3994 on 18.04/20.04) and does
 not fail the build; one that was green, or never ran, does.
+
+BRANCH BUILDS
+-------------
+"Would this fix turn the grid green?" is a question to answer before the fix
+merges. qualification.yaml's builds: section names a label, the release it
+starts from and a patch to its maintainer scripts. build_branch_package.sh
+makes the packages once (the release's own .deb/.rpm, payload untouched,
+scripts patched) into results/builds/<label>/, and this script serves them
+to the VMs over the libvirt bridge for the length of the run.
+
+A branch build is its own grid, compared with its base release, so the
+cells the fix repairs show as fixed. It is never discovered and never the
+baseline for a release's gate: a fix that has not shipped cannot make a
+release candidate's red cells look new.
 """
 
 from __future__ import annotations
 
 import argparse
+import functools
+import hashlib
+import http.server
 import json
 import os
 import re
 import subprocess
 import sys
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -125,6 +144,27 @@ def cell_name(distro: Distro, scenario_id: str) -> str:
     return f"{distro.os_name}--{distro.kernel_label}--{scenario_id}"
 
 
+@dataclass(frozen=True)
+class Build:
+    """A branch build: the base release's packages with a fix applied."""
+    label: str
+    base: str
+    patch: Path
+    source: str = ""
+
+    @property
+    def dir(self) -> Path:
+        return provision.RESULTS / "builds" / self.label
+
+    def package(self, fmt: str, arch: str = "x86_64") -> Path:
+        return self.dir / f"falco-{self.base}-{arch}.{fmt}"
+
+
+# Filled by load_qualification. channel(), expected_version() and probe_env()
+# read it, so a branch build needs no extra argument through the call chain.
+BUILDS: dict[str, Build] = {}
+
+
 def load_qualification(path: Path) -> dict:
     data = yaml.safe_load(path.read_text())
     missing = {"download", "versions", "upgrade_from", "targets", "scenarios"} - set(data)
@@ -137,6 +177,16 @@ def load_qualification(path: Path) -> dict:
     ids = [s.id for s in data["scenarios"]]
     if len(ids) != len(set(ids)):
         raise ValueError(f"{path}: duplicate scenario ids")
+    builds = {}
+    for label, b in (data.get("builds") or {}).items():
+        label = str(label)
+        if "+" not in label or not b.get("base") or not b.get("patch"):
+            raise ValueError(f"{path}: build {label!r} needs a '+' in its label, a base and a patch")
+        builds[label] = Build(label, str(b["base"]), (path.parent / b["patch"]).resolve(),
+                              (b.get("source") or "").strip())
+    data["builds"] = builds
+    BUILDS.clear()
+    BUILDS.update(builds)
     return data
 
 
@@ -145,8 +195,17 @@ def package_format(distro: Distro) -> str:
 
 
 def channel(version: str) -> str:
-    """Release candidates and per-commit builds live in the dev repo."""
+    """Release candidates and per-commit builds live in the dev repo; branch
+    builds are ours, served from results/builds."""
+    if version in BUILDS:
+        return "branch"
     return "dev" if ("-rc" in version or "+" in version) else "stable"
+
+
+def expected_version(version: str) -> str:
+    """The version the package manager should report. A branch build keeps
+    its base release's version: only its maintainer scripts differ."""
+    return BUILDS[version].base if version in BUILDS else version
 
 
 def package_url(download: str, version: str, fmt: str, arch: str = "x86_64") -> str:
@@ -171,10 +230,18 @@ def package_url(download: str, version: str, fmt: str, arch: str = "x86_64") -> 
     return f"{download.rstrip('/')}/{urllib.parse.quote(path)}"
 
 
+def build_url(server: str, build: Build, fmt: str) -> str:
+    return f"{server.rstrip('/')}/{urllib.parse.quote(build.label)}/{build.package(fmt).name}"
+
+
 def probe_env(cell: Cell, download: str, upgrade_from: str) -> dict[str, str]:
     """What falco_probe.sh needs to run this cell in strict mode."""
     fmt = package_format(cell.distro)
-    env = {"KM_PKG_URL": package_url(download, cell.version, fmt)}
+    if cell.version in BUILDS:
+        server = os.environ.get(BUILD_SERVER_ENV, "http://build-server.invalid")
+        env = {"KM_PKG_URL": build_url(server, BUILDS[cell.version], fmt)}
+    else:
+        env = {"KM_PKG_URL": package_url(download, cell.version, fmt)}
     if cell.scenario.driver_choice:
         env["KM_DRIVER_CHOICE"] = cell.scenario.driver_choice
     if cell.scenario.upgrade:
@@ -198,9 +265,13 @@ def plan(qual: dict, distros: dict[str, Distro], versions: list[str],
 # Verdict: deterministic, from the probe's JSON
 # ---------------------------------------------------------------------------
 def version_key(version: str) -> tuple:
-    """Release order: 0.45.0-rc3 < 0.45.0-rc4 < 0.45.0 < 0.45.1-rc1 < 0.45.1."""
+    """Release order: 0.45.0-rc3 < 0.45.0-rc4 < 0.45.0 < 0.45.1-rc1 < 0.45.1.
+    A '+' build sorts right after the version it is built on:
+    0.45.1-rc1 < 0.45.1-rc1+fix-postinst-printenv < 0.45.1."""
+    version, plus, local = version.partition("+")
     base, _, pre = version.partition("-")
-    return (provision.kernel_key(base, 3), 0 if pre else 1, provision.kernel_key(pre or "0", 2))
+    return (provision.kernel_key(base, 3), 0 if pre else 1, provision.kernel_key(pre or "0", 2),
+            local if plus else "")
 
 
 def version_matches(installed: str, wanted: str) -> bool:
@@ -277,9 +348,10 @@ def cell_record(cell: Cell, result: RunResult, env: dict[str, str], upgrade_from
     host_checks = [{"name": c.name, "passed": c.passed, "skipped": c.skipped, "message": c.message}
                    for c in result.checks if not c.name.startswith("falco_")]
     falco = result.falco or {}
-    checks = qualification_checks(falco, cell.version) if "pkg_exit" in falco else []
+    checks = qualification_checks(falco, expected_version(cell.version)) if "pkg_exit" in falco else []
     status, reason = verdict(cell, result, host_checks, checks)
     d = cell.distro
+    build = BUILDS.get(cell.version)
     return {
         "schema_version": SCHEMA_VERSION,
         "cell": cell.name,
@@ -313,6 +385,7 @@ def cell_record(cell: Cell, result: RunResult, env: dict[str, str], upgrade_from
             "base_version": falco.get("base_version") or None,
             "base_state": falco.get("base_state") or None,
         },
+        "build": build_record(build, package_format(d)) if build else None,
         "error": result.error,
         "probe": result.falco,
         "host_checks": host_checks,
@@ -345,6 +418,16 @@ def run_cell(cell: Cell, checks: list[dict], download: str, upgrade_from: str) -
     return record
 
 
+def build_record(build: Build, fmt: str) -> dict:
+    """What a branch-build cell installed and where it came from."""
+    pkg = build.package(fmt)
+    return {"label": build.label, "base": build.base, "source": build.source,
+            "patch": build.patch.name,
+            "package": str(pkg.relative_to(provision.RESULTS)),
+            "package_sha256": hashlib.sha256(pkg.read_bytes()).hexdigest() if pkg.is_file() else None,
+            "provenance": str((build.dir / "PROVENANCE.txt").relative_to(provision.RESULTS))}
+
+
 def rejudge(record: dict) -> dict:
     """
     Recompute a stored cell's checks and verdict from the observations it
@@ -358,7 +441,8 @@ def rejudge(record: dict) -> dict:
     result = RunResult(distro=record["matrix_name"], kernel=record["kernel_observed"],
                        error=record["error"], falco=record["probe"])
     falco = record["probe"] or {}
-    checks = qualification_checks(falco, record["version"]) if "pkg_exit" in falco else []
+    wanted = (record.get("build") or {}).get("base") or record["version"]
+    checks = qualification_checks(falco, wanted) if "pkg_exit" in falco else []
     status, reason = verdict(cell, result, record["host_checks"], checks)
     return {**record, "checks": checks, "status": status, "reason": reason}
 
@@ -368,6 +452,72 @@ def error_record(cell: Cell, why: str, env: dict[str, str], upgrade_from: str) -
     result = RunResult(distro=cell.distro.name, error=why)
     now = time.time()
     return cell_record(cell, result, env, upgrade_from, now, now)
+
+
+# ---------------------------------------------------------------------------
+# Branch builds: make the packages once, serve them to the VMs
+# ---------------------------------------------------------------------------
+BUILD_SERVER_ENV = "KM_BUILD_SERVER"
+# The host's address on libvirt's default network, which every km VM is on.
+BUILD_HOST = os.environ.get("KM_BUILD_HOST", "192.168.122.1")
+
+
+def ensure_build(build: Build) -> None:
+    """Packages for a branch build, made from its patch the first time."""
+    if all(build.package(f).is_file() for f in ("deb", "rpm")) and (build.dir / "PROVENANCE.txt").is_file():
+        return
+    if not build.patch.is_file():
+        raise FileNotFoundError(f"build {build.label}: patch {build.patch} not found")
+    log(f"building {build.label} from {build.base} + {build.patch.name}")
+    subprocess.run([str(HERE / "build_branch_package.sh"), build.base, build.label, str(build.patch)],
+                   check=True, cwd=HERE)
+
+
+class _BuildHandler(http.server.BaseHTTPRequestHandler):
+    """GET/HEAD /<label>/<file> for the declared packages of declared builds, nothing else."""
+    def _file(self) -> Path | None:
+        parts = urllib.parse.unquote(urllib.parse.urlparse(self.path).path).strip("/").split("/")
+        if len(parts) != 2 or parts[0] not in BUILDS:
+            return None
+        build = BUILDS[parts[0]]
+        return next((p for p in (build.package("deb"), build.package("rpm"))
+                     if p.name == parts[1] and p.is_file()), None)
+
+    def _send(self, body: bool) -> None:
+        path = self._file()
+        if not path:
+            self.send_error(404)
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Length", str(path.stat().st_size))
+        self.end_headers()
+        if body:
+            with path.open("rb") as fh:
+                while chunk := fh.read(1 << 20):
+                    self.wfile.write(chunk)
+
+    def do_GET(self):  # noqa: N802
+        self._send(True)
+
+    def do_HEAD(self):  # noqa: N802
+        self._send(False)
+
+    def log_message(self, fmt, *args):
+        log(f"build server: {self.address_string()} {fmt % args}")
+
+
+def start_build_server(host: str = BUILD_HOST) -> str:
+    """Serve BUILDS' packages on the libvirt bridge until this process exits.
+    The URL goes into the environment so --one children reuse it."""
+    if os.environ.get(BUILD_SERVER_ENV):
+        return os.environ[BUILD_SERVER_ENV]
+    server = http.server.ThreadingHTTPServer((host, 0), _BuildHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    url = f"http://{host}:{server.server_address[1]}"
+    os.environ[BUILD_SERVER_ENV] = url
+    log(f"serving branch builds at {url}")
+    return url
 
 
 # ---------------------------------------------------------------------------
@@ -569,11 +719,12 @@ def rc_versions(keys: list[str], fmt: str) -> set[str]:
 def complete_versions(root: Path, cell_names: list[str]) -> set[str]:
     """Versions with a result, of any status, for every planned cell. A run
     killed halfway leaves a partial grid, which --discover offers again so
-    --resume can finish it."""
+    --resume can finish it. Branch builds are not releases and never count."""
     if not root.is_dir():
         return set()
     return {d.name for d in root.iterdir()
-            if d.is_dir() and all((d / f"{n}.json").exists() for n in cell_names)}
+            if d.is_dir() and d.name not in BUILDS
+            and all((d / f"{n}.json").exists() for n in cell_names)}
 
 
 def discover_new(available: set[str], complete: set[str]) -> list[str]:
@@ -620,13 +771,18 @@ def gate(cells: list[dict], version: str) -> dict:
         new      red now; green, blocked, unsupported or absent before
         known    red now and red before: already reported, keeps the build green
         fixed    red before, not red now
+
+    A branch build is never a baseline: its fix has not shipped, so a
+    release's red cells are judged against releases only. A branch build's
+    own gate is judged against the releases before it, its base first.
     """
     def key(c: dict) -> tuple:
         return (c["distro"], c["kernel"], c["scenario"])
 
     vk = version_key(version)
     baseline: dict[tuple, dict] = {}
-    for c in sorted((c for c in cells if version_key(c["version"]) < vk),
+    for c in sorted((c for c in cells if version_key(c["version"]) < vk
+                     and c.get("channel") != "branch"),
                     key=lambda c: version_key(c["version"])):
         baseline[key(c)] = c                # newest earlier version wins
     out = {"version": version, "new": [], "known": [], "fixed": []}
@@ -724,6 +880,9 @@ def main() -> int:
     if args.one:
         version, target, scenario = args.one
         cell = plan(qual, distros, [version], [target], [scenario])[0]
+        if version in qual["builds"]:
+            ensure_build(qual["builds"][version])
+            start_build_server()            # the parent's, when it started one
         provision.ensure_dirs()
         provision.ensure_ssh_key()
         record = run_cell(cell, checks, qual["download"], qual["upgrade_from"])
@@ -737,6 +896,11 @@ def main() -> int:
             return c.result_path.exists() and json.loads(c.result_path.read_text())["status"] != "error"
         cells = [c for c in cells if not done(c)]
 
+    builds = {c.version: qual["builds"][c.version] for c in cells if c.version in qual["builds"]}
+    for build in builds.values():
+        ensure_build(build)
+    if builds:
+        start_build_server()
     for c in cells:
         env = probe_env(c, qual["download"], qual["upgrade_from"])
         log(f"plan {c.version:<12} {c.name:<44} {env['KM_PKG_URL'].rsplit('/', 1)[1]}"

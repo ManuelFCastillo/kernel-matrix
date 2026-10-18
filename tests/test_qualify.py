@@ -694,3 +694,121 @@ def test_gate_reads_the_shipped_matrix_shape(tmp_path):
     (tmp_path / "0.45.0" / "gate.json").write_text(json.dumps({"version": "0.45.0", "new": []}))
     g = qualify.gate(qualify.build_matrix(tmp_path)["cells"], "0.45.1-rc1")
     assert (len(g["new"]), len(g["known"])) == (0, 1)
+
+
+# ---------------------------------------------------------------------------
+# branch builds: a fix on the grid before it merges
+# ---------------------------------------------------------------------------
+FIX = "0.45.1-rc1+fix-postinst-printenv"
+
+APPLY = ROOT / "apply_script_patch.py"
+PATCH = ROOT / "patches" / "fix-postinst-printenv.patch"
+
+
+@pytest.fixture
+def branch_build(monkeypatch):
+    build = qualify.Build(FIX, "0.45.1-rc1", PATCH, "test")
+    monkeypatch.setitem(qualify.BUILDS, FIX, build)
+    monkeypatch.setenv(qualify.BUILD_SERVER_ENV, "http://192.168.122.1:4242")
+    return build
+
+
+def test_shipped_builds_parse_and_point_at_a_patch_in_the_repo():
+    qual = qualify.load_qualification(ROOT / "qualification.yaml")
+    assert FIX in qual["builds"]
+    build = qual["builds"][FIX]
+    assert build.base == "0.45.1-rc1" and build.patch.is_file()
+    assert qualify.channel(FIX) == "branch"
+
+
+def test_branch_build_sorts_after_its_base_and_before_the_next_release():
+    order = ["0.45.0", "0.45.1-rc1", FIX, "0.45.1-rc2", "0.45.1"]
+    assert sorted(reversed(order), key=qualify.version_key) == order
+
+
+def test_branch_build_is_served_by_us_not_the_falco_repo(branch_build):
+    cell = qualify.Cell(FIX, distro(), FRESH_AUTO)
+    env = qualify.probe_env(cell, DL, "0.44.1")
+    assert env["KM_PKG_URL"] == ("http://192.168.122.1:4242/0.45.1-rc1%2Bfix-postinst-printenv/"
+                                 "falco-0.45.1-rc1-x86_64.deb")
+    up = qualify.probe_env(qualify.Cell(FIX, distro("rocky-8", "4.18"), UPGRADE), DL, "0.44.1")
+    assert up["KM_PKG_URL"].endswith("/falco-0.45.1-rc1-x86_64.rpm")
+    assert up["KM_BASE_PKG_URL"] == f"{DL}/rpm/falco-0.44.1-x86_64.rpm"   # N-1 is the real release
+
+
+def test_branch_build_must_install_its_base_version(branch_build):
+    # The package keeps the release's version: only its scripts changed.
+    rec = record(version=FIX, pkg_version="0.45.1-rc1")
+    assert rec["status"] == "pass" and rec["channel"] == "branch"
+    assert rec["build"]["base"] == "0.45.1-rc1"
+    assert record(version=FIX, pkg_version="0.45.0")["status"] == "fail"
+    assert qualify.rejudge(json.loads(json.dumps(rec)))["status"] == "pass"
+
+
+def test_branch_build_is_never_a_baseline_for_a_release():
+    # The fix turned 20.04 green on the branch. rc2 still ships the bug:
+    # that is known red, not a regression against an unshipped fix.
+    fixed = {**gcell(FIX, "pass"), "channel": "branch"}
+    cells = [gcell("0.45.1-rc1", "fail"), fixed, gcell("0.45.1-rc2", "fail")]
+    g = qualify.gate(cells, "0.45.1-rc2")
+    assert (len(g["new"]), len(g["known"])) == (0, 1)
+    assert g["known"][0]["baseline_version"] == "0.45.1-rc1"
+
+
+def test_branch_build_gate_shows_what_the_fix_repairs():
+    cells = [gcell("0.45.1-rc1", "fail"), gcell("0.45.1-rc1", "pass", "debian-12", "6.1"),
+             {**gcell(FIX, "pass"), "channel": "branch"},
+             {**gcell(FIX, "pass", "debian-12", "6.1"), "channel": "branch"}]
+    g = qualify.gate(cells, FIX)
+    assert [r["cell"] for r in g["fixed"]] == ["ubuntu-20.04--5.4--fresh-auto"]
+    assert g["fixed"][0]["baseline_version"] == "0.45.1-rc1" and not g["new"]
+
+
+def test_branch_builds_are_never_discovered(tmp_path, branch_build):
+    names = ["ubuntu-20.04--5.4--fresh-auto"]
+    for version in ("0.45.1-rc1", FIX):
+        (tmp_path / version).mkdir()
+        (tmp_path / version / f"{names[0]}.json").write_text("{}")
+    assert qualify.complete_versions(tmp_path, names) == {"0.45.1-rc1"}
+
+
+def test_build_server_serves_only_declared_packages(tmp_path, monkeypatch):
+    import urllib.error
+    import urllib.request
+    monkeypatch.setattr(provision, "RESULTS", tmp_path)
+    build = qualify.Build(FIX, "0.45.1-rc1", PATCH)
+    build.dir.mkdir(parents=True)
+    build.package("deb").write_bytes(b"deb bytes")
+    (build.dir / "PROVENANCE.txt").write_text("secret-ish")
+    monkeypatch.setitem(qualify.BUILDS, FIX, build)
+    monkeypatch.delenv(qualify.BUILD_SERVER_ENV, raising=False)
+    url = qualify.start_build_server("127.0.0.1")
+    assert urllib.request.urlopen(qualify.build_url(url, build, "deb")).read() == b"deb bytes"
+    for path in ("/0.45.1-rc1%2Bfix-postinst-printenv/PROVENANCE.txt",
+                 "/0.45.1-rc1%2Bfix-postinst-printenv/../../etc/passwd", "/other/falco.deb"):
+        with pytest.raises(urllib.error.HTTPError):
+            urllib.request.urlopen(url + path)
+
+
+def test_apply_script_patch_fixes_every_embedded_copy(tmp_path):
+    body = PATCH.read_text()
+    old = "\n".join(l[1:] for l in body.splitlines()
+                    if l.startswith((" ", "-")) and not l.startswith("---"))
+    # Two copies, as in an rpm spec, one of them %-escaped the way rpmrebuild writes it.
+    script = tmp_path / "postinst"
+    script.write_text(f"#!/bin/sh\n{old}\n\n{old}\n")
+    subprocess.run([sys.executable, str(APPLY), str(PATCH), str(script)], check=True)
+    text = script.read_text()
+    assert text.count("printenv 2>/dev/null) || driver_env=") == 2
+    assert "driver_env=$(falcoctl driver printenv)\n" not in text
+    spec = subprocess.run([sys.executable, str(APPLY), str(PATCH), "-"], check=True,
+                          input=old.replace("%", "%%") + "\n", capture_output=True, text=True).stdout
+    assert "|| driver_env=" in spec and "%%post" in spec
+
+
+def test_apply_script_patch_refuses_a_release_it_does_not_fit(tmp_path):
+    script = tmp_path / "postinst"
+    script.write_text("#!/bin/sh\npackage_driver_version() { :; }\n")
+    out = subprocess.run([sys.executable, str(APPLY), str(PATCH), str(script)],
+                         capture_output=True, text=True)
+    assert out.returncode != 0

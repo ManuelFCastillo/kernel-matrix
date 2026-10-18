@@ -79,3 +79,22 @@ scenarios:
     description: >-
       upgrade_from installed with automatic selection, then upgraded in place
       non-interactively, keeping existing configuration files.
+
+# ---------------------------------------------------------------------------
+#  Branch builds: a fix on the grid before it merges
+# ---------------------------------------------------------------------------
+#  label     <base>+<name>. Run with: ./qualify.py --version <label>
+#  base      the release whose packages the build starts from
+#  patch     git diff of scripts/packaging/functions.sh.in in a falco checkout.
+#            build_branch_package.sh applies it to every maintainer script of
+#            the base .deb and .rpm (payload untouched) into
+#            results/builds/<label>/, once, with PROVENANCE.txt as the proof.
+#  A branch build is never discovered and never a gate baseline for a release.
+builds:
+  0.45.1-rc1+fix-postinst-printenv:
+    base: 0.45.1-rc1
+    patch: patches/fix-postinst-printenv.patch
+    source: >-
+      falco#3994 fix: guard the bare `falcoctl driver printenv` in
+      package_driver_version (branch fix/postinst-printenv-without-modern-ebpf,
+      off master 066991c, not yet merged), applied to the 0.45.1-rc1 packages.
