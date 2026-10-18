@@ -5,3 +5,7 @@ __pycache__/
 results/
 .xray-credentials
 artifacts/
+
+# editor and hand-made backups (.xray-credentials~, observability/.env.bak)
+*~
+*.bak

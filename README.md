@@ -343,3 +343,7 @@ observability/       docker compose: Prometheus, Grafana, Pushgateway, nginx
 - Built and tested on a single bare-metal host with KVM. The production shape
   would be a disposable Jenkins controller with a labelled `kvm` build agent,
   so only the machine that needs privileged access has it.
+
+## License
+
+Apache-2.0, the license Falco itself uses. See [LICENSE](LICENSE).
