@@ -117,6 +117,8 @@ table.grid { border-collapse: separate; border-spacing: 6px; width: 100%; min-wi
 .s-unsupported { background: var(--warn-bg); color: var(--warn); }
 .s-blocked { background: var(--idle-bg); color: var(--idle); }
 .s-running { background: var(--accent-bg); color: var(--accent); }
+/* Cells only: on the legend swatch, which is not positioned, inset:-1px
+   resolved against the viewport and laid a click-eating ring over the header. */
 .cell.s-running::after { content: ""; position: absolute; inset: -1px; border-radius: 8px; border: 1px solid var(--accent); animation: ring 1.6s ease-in-out infinite; }
 .s-queued, .s-notrun { background: transparent; border: 1px dashed var(--line); color: var(--faint); cursor: default; }
 .cell .new { position: absolute; top: -7px; right: -5px; font: 600 9px/1 var(--f-mono); letter-spacing: .06em; background: var(--fail); color: #fff; border-radius: 4px; padding: 3px 4px; }
