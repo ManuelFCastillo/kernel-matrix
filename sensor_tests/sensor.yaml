@@ -32,8 +32,12 @@
 # 0.45.x grid lands on modern eBPF, so half the cells force the kernel
 # module: a driver no auto cell ever loads would otherwise go untested.
 #
+# ubuntu-20.04 (stock 5.4) is red on releases with falco#3994 and green with
+# the fix branch build; it stays in so the two runs compare cell by cell,
+# and on a release its install test names the cause.
+#
 # Left out on purpose: cells whose install is already red in the qualify
-# grid (falco#3994 on ubuntu-18.04/20.04, the falcoctl kmod headers bug on
+# grid (falco#3994 then systemd 237 on ubuntu-18.04, the falcoctl kmod headers bug on
 # ubuntu-22.04/debian-12 kmod, unsigned kmod under Secure Boot on rocky-9).
 # There the install test fails and every other test skips with its reason;
 # qualify.py already reports them, and a sensor suite that can only skip
@@ -49,6 +53,7 @@ cells:
   - {target: debian-11,        scenario: fresh-kmod}   # 5.10
   - {target: rocky-8,          scenario: fresh-kmod}   # 4.18, glibc 2.28
   - {target: fedora-44,        scenario: fresh-kmod}   # newest kernel, 6.19
+  - {target: ubuntu-20.04,     scenario: fresh-auto}   # 5.4: auto lands on kmod
 
 # How long an alert may take to reach the outputs before it counts as missed.
 alert_timeout_s: 30

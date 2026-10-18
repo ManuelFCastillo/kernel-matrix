@@ -119,7 +119,7 @@ def test_reboot(guest, sensor, measure):
 # Package transitions
 # ---------------------------------------------------------------------------
 def fetch_pkg(km, guest, version: str) -> str:
-    url = qualify.package_url(km["qual"]["download"], version, guest.fmt)
+    url = qualify.version_url(km["qual"]["download"], version, guest.fmt)
     path = f"/var/tmp/km-pkg-{version}.{guest.fmt}"
     guest.sh(f"test -s {path} || curl -fsSL --retry 3 -o {path} '{url}'", timeout=600, check=True)
     return path
@@ -162,11 +162,12 @@ def test_downgrade(km, guest, sensor, n_minus_1):
 
 
 def test_upgrade_back(km, guest, sensor, n_minus_1):
-    if installed(guest)[1] and qualify.version_matches(installed(guest)[1], km["version"]):
+    want = qualify.expected_version(km["version"])     # a branch build keeps its base version
+    if installed(guest)[1] and qualify.version_matches(installed(guest)[1], want):
         pytest.skip("still on the version under test (the downgrade did not happen)")
     path = fetch_pkg(km, guest, km["version"])
     assert_transition(km, guest, sensor, "upgrade-back",
-                      pkg_commands(guest.fmt)["install"].format(file=path), km["version"])
+                      pkg_commands(guest.fmt)["install"].format(file=path), want)
 
 
 def test_remove(km, guest, sensor):

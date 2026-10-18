@@ -5,6 +5,7 @@ run.py -- the sensor suite over several cells, a few VMs at a time.
     ./sensor_tests/run.py --version 0.45.1-rc1                  # cells in sensor.yaml
     ./sensor_tests/run.py --version 0.45.1-rc1 --target ubuntu-24.04 --scenario fresh-kmod
     ./sensor_tests/run.py --version 0.45.1-rc1 --soak-minutes 60 --max-vms 2
+    ./sensor_tests/run.py --version 0.45.1-rc1+fix-postinst-printenv   # a branch build
 
 Each cell is its own pytest process (one VM each), so a cell that hangs or
 panics its guest cannot take the others with it. Like qualify.py, every
@@ -66,6 +67,9 @@ def main() -> int:
     except ValueError as exc:
         log(str(exc), "ERROR")
         return 2
+    # A branch build is served from this process for the whole run; the
+    # pytest children find it through KM_BUILD_SERVER in their environment.
+    qualify.serve_build(qual, args.version)
 
     out_root = ROOT / "results" / "sensor" / args.version
     pending = list(planned)

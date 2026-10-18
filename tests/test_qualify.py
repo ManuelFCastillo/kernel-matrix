@@ -812,3 +812,22 @@ def test_apply_script_patch_refuses_a_release_it_does_not_fit(tmp_path):
     out = subprocess.run([sys.executable, str(APPLY), str(PATCH), str(script)],
                          capture_output=True, text=True)
     assert out.returncode != 0
+
+
+def test_version_url_sends_a_branch_build_to_our_server_and_a_release_to_falco(branch_build):
+    # sensor_tests fetches the version under test and N-1 by version: the
+    # branch build from the run's build server, N-1 from download.falco.org.
+    assert qualify.version_url(DL, FIX, "rpm") == (
+        "http://192.168.122.1:4242/0.45.1-rc1%2Bfix-postinst-printenv/falco-0.45.1-rc1-x86_64.rpm")
+    assert qualify.version_url(DL, "0.44.1", "deb") == qualify.package_url(DL, "0.44.1", "deb")
+
+
+def test_serve_build_starts_once_for_a_branch_build_and_never_for_a_release(monkeypatch, branch_build):
+    calls = []
+    monkeypatch.setattr(qualify, "ensure_build", lambda b: calls.append(("build", b.label)))
+    monkeypatch.setattr(qualify, "start_build_server", lambda: calls.append(("serve",)))
+    qual = {"builds": {FIX: branch_build}}
+    qualify.serve_build(qual, "0.45.1-rc1")
+    assert calls == []
+    qualify.serve_build(qual, FIX)
+    assert calls == [("build", FIX), ("serve",)]

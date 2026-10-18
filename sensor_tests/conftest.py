@@ -111,6 +111,7 @@ def km(pytestconfig) -> dict:
     distros = {d.name: d for d in distros_list}
     cell = qualify.plan(qual, distros, [version], [target],
                         [pytestconfig.getoption("--km-scenario")])[0]
+    qualify.serve_build(qual, version)  # branch builds; run.py's server when it started one
     settings = yaml.safe_load((HERE / "sensor.yaml").read_text())
     soak = pytestconfig.getoption("--km-soak-minutes")
     if soak is not None:
@@ -206,11 +207,15 @@ def install(km, guest) -> dict:
     ev = km["results"] / "evidence"
     ev.mkdir(parents=True, exist_ok=True)
     probe = provision.run_falco_probe(guest.distro, guest.ip, evidence_dir=ev, env=env)
-    checks = qualify.qualification_checks(probe, cell.version) if "pkg_exit" in probe else []
+    # A branch build reports its base release's version: only its scripts differ.
+    checks = (qualify.qualification_checks(probe, qualify.expected_version(cell.version))
+              if "pkg_exit" in probe else [])
     result = provision.RunResult(distro=guest.distro.name, kernel=guest.out("uname -r"), falco=probe)
     status, reason = qualify.verdict(cell, result, [], checks)
     (km["results"] / "install.json").write_text(json.dumps(
-        {"status": status, "reason": reason, "checks": checks, "probe": probe}, indent=2))
+        {"status": status, "reason": reason, "checks": checks, "probe": probe,
+         "build": qualify.build_record(qualify.BUILDS[cell.version], guest.fmt)
+                  if cell.version in qualify.BUILDS else None}, indent=2))
     log_step(f"install: {status} {reason}")
     return {"status": status, "reason": reason, "checks": checks, "probe": probe, "env": env}
 

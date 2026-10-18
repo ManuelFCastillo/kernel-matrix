@@ -234,14 +234,19 @@ def build_url(server: str, build: Build, fmt: str) -> str:
     return f"{server.rstrip('/')}/{urllib.parse.quote(build.label)}/{build.package(fmt).name}"
 
 
+def version_url(download: str, version: str, fmt: str) -> str:
+    """Where a version's package comes from: download.falco.org for a
+    release, the build server this run started for a branch build."""
+    if version in BUILDS:
+        server = os.environ.get(BUILD_SERVER_ENV, "http://build-server.invalid")
+        return build_url(server, BUILDS[version], fmt)
+    return package_url(download, version, fmt)
+
+
 def probe_env(cell: Cell, download: str, upgrade_from: str) -> dict[str, str]:
     """What falco_probe.sh needs to run this cell in strict mode."""
     fmt = package_format(cell.distro)
-    if cell.version in BUILDS:
-        server = os.environ.get(BUILD_SERVER_ENV, "http://build-server.invalid")
-        env = {"KM_PKG_URL": build_url(server, BUILDS[cell.version], fmt)}
-    else:
-        env = {"KM_PKG_URL": package_url(download, cell.version, fmt)}
+    env = {"KM_PKG_URL": version_url(download, cell.version, fmt)}
     if cell.scenario.driver_choice:
         env["KM_DRIVER_CHOICE"] = cell.scenario.driver_choice
     if cell.scenario.upgrade:
@@ -505,6 +510,14 @@ class _BuildHandler(http.server.BaseHTTPRequestHandler):
 
     def log_message(self, fmt, *args):
         log(f"build server: {self.address_string()} {fmt % args}")
+
+
+def serve_build(qual: dict, version: str) -> None:
+    """For a branch build: make its packages if needed and serve them. A
+    no-op for a release, and for a child whose parent already serves them."""
+    if version in qual["builds"]:
+        ensure_build(qual["builds"][version])
+        start_build_server()
 
 
 def start_build_server(host: str = BUILD_HOST) -> str:
@@ -880,9 +893,7 @@ def main() -> int:
     if args.one:
         version, target, scenario = args.one
         cell = plan(qual, distros, [version], [target], [scenario])[0]
-        if version in qual["builds"]:
-            ensure_build(qual["builds"][version])
-            start_build_server()            # the parent's, when it started one
+        serve_build(qual, version)          # the parent's server, when it started one
         provision.ensure_dirs()
         provision.ensure_ssh_key()
         record = run_cell(cell, checks, qual["download"], qual["upgrade_from"])
