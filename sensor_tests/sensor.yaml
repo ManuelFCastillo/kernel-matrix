@@ -1,0 +1,87 @@
+# ============================================================================
+#  sensor.yaml  --  what the sensor suite runs, and the numbers it gates on
+# ============================================================================
+#
+#  qualify.py answers "does the package install and fire ONE rule?" in a VM
+#  that lives about two minutes. sensor_tests/ keeps the VM for half an hour
+#  and asks the questions a fleet asks after install day:
+#
+#    test_10_detection   the shipped ruleset fires, rule by rule, and the
+#                        driver delivers each syscall family (file, process,
+#                        network, privilege) with its arguments decoded
+#    test_20_container   container events carry the container's identity
+#    test_30_outputs     file, journal, syslog, http, program, webserver,
+#                        Prometheus, falcosidekick (gRPC: see the test)
+#    test_40_load        nothing lost and nothing dropped under a syscall
+#                        storm; CPU and memory gated, idle and loaded
+#    test_50_soak        same PID, no leak, still detecting after N minutes
+#    test_60_lifecycle   restart, hot reload, SIGHUP, reboot, downgrade,
+#                        upgrade back, remove, purge, leftovers
+#
+#  Files run in that order on ONE VM; lifecycle is last because it ends with
+#  the package gone.
+#
+#  Gates are deliberately loose until a few nightlies have measured real
+#  numbers: they exist to catch a 2x regression, not 5% noise. Every
+#  measurement is written to results/sensor/<version>/<cell>/measurements.json
+#  whether or not it gated, so tightening a gate is a data decision.
+# ============================================================================
+
+# Cells run by `run.py` when no --target is given. Each one is a matrix.yaml
+# target and a qualification.yaml scenario. Every fresh-auto cell in the
+# 0.45.x grid lands on modern eBPF, so half the cells force the kernel
+# module: a driver no auto cell ever loads would otherwise go untested.
+#
+# Left out on purpose: cells whose install is already red in the qualify
+# grid (falco#3994 on ubuntu-18.04/20.04, the falcoctl kmod headers bug on
+# ubuntu-22.04/debian-12 kmod, unsigned kmod under Secure Boot on rocky-9).
+# There the install test fails and every other test skips with its reason;
+# qualify.py already reports them, and a sensor suite that can only skip
+# would spend 2 VM-minutes saying so.
+cells:
+  # modern eBPF
+  - {target: ubuntu-24.04,     scenario: fresh-auto}   # 6.8
+  - {target: ubuntu-22.04,     scenario: fresh-auto}   # 5.15
+  - {target: debian-12,        scenario: fresh-auto}   # 6.1
+  - {target: rocky-9,          scenario: fresh-auto}   # 5.14, UEFI + Secure Boot
+  # kernel module
+  - {target: ubuntu-20.04-hwe, scenario: fresh-kmod}   # old userspace, 5.15
+  - {target: debian-11,        scenario: fresh-kmod}   # 5.10
+  - {target: rocky-8,          scenario: fresh-kmod}   # 4.18, glibc 2.28
+  - {target: fedora-44,        scenario: fresh-kmod}   # newest kernel, 6.19
+
+# How long an alert may take to reach the outputs before it counts as missed.
+alert_timeout_s: 30
+
+load:
+  duration_s: 60
+  workers: 1              # exec+open loops; the VM has 2 vCPUs
+  marker_interval_s: 2    # one marker event every N seconds during the storm
+  gates:
+    marker_loss_max: 0            # every marker must arrive
+    drop_ratio_max: 0.01          # kernel drops / kernel events during the storm
+    cpu_percent_max: 120          # of one core, Falco's process only
+    rss_mb_max: 600
+
+idle:
+  sample_s: 20
+  gates:
+    cpu_percent_max: 5
+    rss_mb_max: 400
+
+soak:
+  minutes: 10             # override with --km-soak-minutes; a weekly run uses 60
+  interval_s: 60          # one marker and one sample per interval
+  background_exec_per_s: 20
+  gates:
+    rss_growth_mb_max: 50         # mean of the last third minus the first third
+    marker_loss_max: 0
+    restarts_max: 0
+
+falcosidekick:
+  version: 2.35.0
+  url: https://github.com/falcosecurity/falcosidekick/releases/download/2.35.0/falcosidekick_2.35.0_linux_amd64.tar.gz
+  sha256: 9e140a67392c4f634e751e222bc1d0171b6b5eff9d49d4423393dd57ba4c34c3
+
+container:
+  image: docker.io/library/alpine:3.20

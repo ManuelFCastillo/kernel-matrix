@@ -18,6 +18,9 @@
 //     Unit tests   the code that decides a cell's colour, before any VM
 //     Qualify      qualify.py --version <rc>: every distro/kernel x scenario
 //                  cell on a real VM, at most 4 VMs on the host at once
+//     Sensor tests sensor_tests/run.py --version <rc>: pytest on long-lived
+//                  VMs (sensor.yaml cells, 3 at once): ruleset, syscall
+//                  and container detection, outputs, load, soak, lifecycle
 //     Gate         qualify.py --gate <rc>: red only for cells that are red
 //                  now and were not red in an earlier version
 //
@@ -56,6 +59,16 @@ pipeline {
             name: 'VERSIONS',
             defaultValue: '',
             description: 'Space-separated versions to qualify, e.g. "0.45.1-rc1". Empty: discover new release candidates in the dev repo. A listed version is re-run from scratch.'
+        )
+        booleanParam(
+            name: 'SENSOR_TESTS',
+            defaultValue: true,
+            description: 'Run sensor_tests/ (detection, containers, outputs, load, soak, lifecycle) on the cells in sensor_tests/sensor.yaml for each qualified version.'
+        )
+        string(
+            name: 'SENSOR_SOAK_MINUTES',
+            defaultValue: '10',
+            description: 'Soak length per sensor cell. 0 skips the soak test.'
         )
     }
 
@@ -161,6 +174,36 @@ pipeline {
             }
         }
 
+        stage('Sensor tests') {
+            // After Qualify, before Gate: a red Gate stops the build, and the
+            // sensor results matter most on exactly those nights.
+            //
+            // The grid asks "does it install and fire one rule"; this asks
+            // what a fleet asks after install day, on a VM that lives ~30 min
+            // (see sensor_tests/conftest.py). Failures mark the build
+            // UNSTABLE through the junit step rather than failing it: the
+            // load and soak gates are new and loose, and should earn the
+            // right to block a release over a few nightlies first.
+            when { expression { params.SENSOR_TESTS && !toQualify.isEmpty() } }
+            steps {
+                script {
+                    for (v in toQualify) {
+                        def rc = sh(script: "./.venv/bin/python sensor_tests/run.py --version '${v}' " +
+                                            "--max-vms 3 --soak-minutes '${params.SENSOR_SOAK_MINUTES}'",
+                                    returnStatus: true)
+                        if (rc > 1) {
+                            error("sensor_tests/run.py --version ${v} exited ${rc}")
+                        }
+                    }
+                }
+            }
+            post {
+                always {
+                    junit testResults: 'results/sensor/*/*/junit.xml', allowEmptyResults: true
+                }
+            }
+        }
+
         stage('Gate') {
             when { expression { !toQualify.isEmpty() } }
             steps {
@@ -185,6 +228,7 @@ pipeline {
                 // version as history; archiving all of it every night would
                 // copy the same evidence bundles again and again.
                 def patterns = toQualify.collect { "results/qualification/${it}/**" }
+                patterns += toQualify.collect { "results/sensor/${it}/**" }
                 patterns << 'results/qualification/matrix.json'
                 archiveArtifacts artifacts: patterns.join(', '), allowEmptyArchive: true
             }

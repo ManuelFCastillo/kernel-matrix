@@ -1,0 +1,124 @@
+# ============================================================================
+#  km_coverage_rules.yaml -- driver coverage, one rule per syscall family
+# ============================================================================
+#
+#  Installed in /etc/falco/rules.d/ by sensor_tests only. The default rules
+#  answer "does the shipped ruleset fire"; these answer the question under
+#  it: does THIS driver on THIS kernel deliver the event, with its
+#  arguments decoded? A default rule can stay quiet for a reason that has
+#  nothing to do with the driver (an exclusion macro, rule_matching: first),
+#  and these cannot.
+#
+#  Every condition is scoped by proc.cmdline containing "km-cov" (all
+#  triggers run with a path or argument under /tmp/km-cov), so nothing else
+#  on the guest can match and no default rule's event is shadowed. Only
+#  macros that falco_rules.yaml has shipped for years are used.
+#
+#  Outputs carry %evt.args so a test can assert the arguments, not just the
+#  event type, survived the trip from the kernel.
+# ============================================================================
+
+- rule: KM cov exec
+  desc: execve of a test binary (process events)
+  condition: spawned_process and proc.name startswith "kmcov-"
+  output: km-cov exec | evt_type=%evt.type proc=%proc.name exepath=%proc.exepath cmd=%proc.cmdline parent=%proc.pname
+  priority: NOTICE
+  tags: [km_coverage, process]
+
+- rule: KM cov open read
+  desc: open for read of a file under /tmp/km-cov
+  condition: open_read and fd.name startswith "/tmp/km-cov/"
+  output: km-cov open read | evt_type=%evt.type file=%fd.name proc=%proc.name
+  priority: NOTICE
+  tags: [km_coverage, file]
+
+- rule: KM cov open write
+  desc: open for write (create) of a file under /tmp/km-cov
+  condition: open_write and fd.name startswith "/tmp/km-cov/"
+  output: km-cov open write | evt_type=%evt.type file=%fd.name flags=%evt.arg.flags proc=%proc.name
+  priority: NOTICE
+  tags: [km_coverage, file]
+
+- rule: KM cov unlink
+  condition: evt.type in (unlink, unlinkat) and proc.cmdline contains "km-cov"
+  desc: file deletion
+  output: km-cov unlink | evt_type=%evt.type args=%evt.args proc=%proc.name
+  priority: NOTICE
+  tags: [km_coverage, file]
+
+- rule: KM cov rename
+  desc: file rename
+  condition: evt.type in (rename, renameat, renameat2) and proc.cmdline contains "km-cov"
+  output: km-cov rename | evt_type=%evt.type args=%evt.args proc=%proc.name
+  priority: NOTICE
+  tags: [km_coverage, file]
+
+- rule: KM cov mkdir
+  desc: directory creation
+  condition: evt.type in (mkdir, mkdirat) and proc.cmdline contains "km-cov"
+  output: km-cov mkdir | evt_type=%evt.type args=%evt.args proc=%proc.name
+  priority: NOTICE
+  tags: [km_coverage, file]
+
+- rule: KM cov chmod
+  desc: permission change
+  condition: evt.type in (chmod, fchmod, fchmodat) and proc.cmdline contains "km-cov"
+  output: km-cov chmod | evt_type=%evt.type args=%evt.args proc=%proc.name
+  priority: NOTICE
+  tags: [km_coverage, file]
+
+- rule: KM cov symlink
+  desc: symlink creation (to a non-sensitive target)
+  condition: evt.type in (symlink, symlinkat) and proc.cmdline contains "km-cov"
+  output: km-cov symlink | evt_type=%evt.type args=%evt.args proc=%proc.name
+  priority: NOTICE
+  tags: [km_coverage, file]
+
+- rule: KM cov connect
+  desc: TCP connect to the test listener
+  condition: evt.type = connect and proc.cmdline contains "km-cov" and fd.l4proto = tcp
+  output: km-cov connect | evt_type=%evt.type connection=%fd.name sport=%fd.sport res=%evt.res proc=%proc.name
+  priority: NOTICE
+  tags: [km_coverage, network]
+
+- rule: KM cov accept
+  desc: TCP accept on the test listener
+  condition: evt.type in (accept, accept4) and proc.cmdline contains "km-cov"
+  output: km-cov accept | evt_type=%evt.type connection=%fd.name sport=%fd.sport proc=%proc.name
+  priority: NOTICE
+  tags: [km_coverage, network]
+
+- rule: KM cov listen
+  desc: listen on the test port
+  condition: evt.type = listen and proc.cmdline contains "km-cov"
+  output: km-cov listen | evt_type=%evt.type args=%evt.args fd=%fd.name proc=%proc.name
+  priority: NOTICE
+  tags: [km_coverage, network]
+
+- rule: KM cov udp send
+  desc: UDP datagram to the test port
+  condition: evt.type in (sendto, sendmsg) and proc.cmdline contains "km-cov" and fd.l4proto = udp
+  output: km-cov udp send | evt_type=%evt.type connection=%fd.name proc=%proc.name
+  priority: NOTICE
+  tags: [km_coverage, network]
+
+- rule: KM cov setuid
+  desc: privilege change
+  condition: evt.type in (setuid, setresuid) and proc.cmdline contains "km-cov"
+  output: km-cov setuid | evt_type=%evt.type args=%evt.args user=%user.name proc=%proc.name
+  priority: NOTICE
+  tags: [km_coverage, privilege]
+
+- rule: KM cov memfd
+  desc: anonymous memory file (the first step of fileless execution)
+  condition: evt.type = memfd_create and proc.cmdline contains "km-cov"
+  output: km-cov memfd | evt_type=%evt.type args=%evt.args proc=%proc.name
+  priority: NOTICE
+  tags: [km_coverage, process]
+
+- rule: KM cov mount
+  desc: mount of a tmpfs under /tmp/km-cov
+  condition: evt.type = mount and proc.cmdline contains "km-cov"
+  output: km-cov mount | evt_type=%evt.type args=%evt.args proc=%proc.name
+  priority: NOTICE
+  tags: [km_coverage, privilege]

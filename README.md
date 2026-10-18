@@ -277,6 +277,35 @@ self-contained page for sharing; it keeps the file list and hashes, plus the cit
 
 ---
 
+## Sensor tests (pytest)
+
+qualify.py answers "does the package install and fire one rule" on a VM that lives about two
+minutes. `sensor_tests/` keeps one VM per cell for about half an hour and asks what a fleet asks
+after install day. One pytest session is one cell (version x target x scenario):
+
+| File | What it gates on |
+|---|---|
+| `test_00_install` | qualify.py's own four checks, so the two can never disagree |
+| `test_10_detection` | the shipped ruleset validates; every shipped rule has a trigger or a written reason it has none; each stable rule fires on its event; the driver delivers 15 syscall families (exec, open, unlink, rename, mkdir, chmod, symlink, listen/connect/accept, UDP, setuid, memfd, mount) with arguments decoded |
+| `test_20_container` | an event inside docker/podman carries the container id and image; container rules fire |
+| `test_30_outputs` | JSON file, journal, syslog, http_output, program_output, `/healthz`, Prometheus `/metrics`, falcosidekick to a webhook; gRPC skips when the version ships none |
+| `test_40_load` | idle CPU/RSS, then a syscall storm: every marker alerts, kernel drop ratio, CPU and peak RSS under `sensor.yaml` gates |
+| `test_50_soak` | N minutes under light load: same PID, no systemd restarts, no missed markers, RSS growth under a gate |
+| `test_60_lifecycle` | restart, hot reload, SIGHUP, bad rules push recovers, reboot, downgrade to N-1, upgrade back, remove, purge leaves nothing |
+
+```
+python3 -m pytest sensor_tests --km-version 0.45.1-rc1 --km-target ubuntu-24.04 [--km-scenario fresh-kmod] [--km-keep]
+python3 sensor_tests/run.py --version 0.45.1-rc1            # the cells in sensor_tests/sensor.yaml, 3 VMs at a time
+```
+
+If the package does not install, `test_00_install` fails with the reason and every test that
+needs a running sensor skips pointing at it. Results land in `results/sensor/<version>/<cell>/`:
+`junit.xml`, `measurements.json` (every number, gated or not), `rule-coverage.json`, `soak.json`,
+and `evidence/` (alert and metrics files, falco journal, lifecycle package logs, the evidence
+bundle). Jenkinsfile.qualify runs it as the Sensor tests stage; failures mark the build UNSTABLE.
+
+---
+
 ## Layout
 
 ```
@@ -296,6 +325,7 @@ push_metrics.py      results.json -> Prometheus Pushgateway
 xray_import.py       JUnit -> Jira/Xray, one environment per kernel
 Jenkinsfile          preflight -> lint -> parallel matrix -> publish
 Jenkinsfile.qualify  nightly: discover new Falco RCs -> qualify -> gate on new red cells
+sensor_tests/        pytest on long-lived VMs: detection, containers, outputs, load, soak, lifecycle
 dashboard/           Kestrel QA: live qualification dashboard (server.py, kestrel.html, service unit)
 observability/       docker compose: Prometheus, Grafana, Pushgateway, nginx
 ```
