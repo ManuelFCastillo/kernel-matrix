@@ -303,3 +303,12 @@ def test_page_has_print_styles_and_an_export_menu():
 def test_pdf_renders_a_real_pdf(grid):
     pdf = server.render_pdf(build(grid), "0.45.0")
     assert pdf.startswith(b"%PDF-") and len(pdf) > 10_000
+
+
+def test_page_has_the_logo_with_a_name_and_a_print_image():
+    page = server.page_fragment()
+    assert "<span class=\"logo\" role=\"img\" aria-label=\"Kestrel QA\">" in page
+    assert page.count("<link rel=\"icon\"") == 1
+    # Masks can print as a solid block; print must swap in a plain image.
+    print_css = page[page.index("@media print"):]
+    assert ".logo { background: url(data:image/png" in print_css
