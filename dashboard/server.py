@@ -10,6 +10,11 @@ owns.
 
     python3 dashboard/server.py                      # http://hardac2:8099
     python3 dashboard/server.py --export kestrel.html  # frozen snapshot page
+    python3 dashboard/server.py --results A --results B  # several result roots
+
+Several --results roots show as one grid, so the grid of record (the Jenkins
+workspace) and a hand-run branch build sit in the same Release picker. Each
+version is read from the first root that has it.
 
 Read-only by construction. The only files it serves are cell results, cell
 logs and the files a cell's evidence manifest lists, each resolved against
@@ -158,15 +163,31 @@ def load_records(root: Path) -> list[dict]:
     return out
 
 
-def fingerprint(root: Path) -> str:
+def as_roots(root: Path | list[Path]) -> list[Path]:
+    return [root] if isinstance(root, Path) else list(root)
+
+
+def owners(roots: list[Path]) -> dict[str, Path]:
+    """Version -> the root it is read from: the first root that has it."""
+    out: dict[str, Path] = {}
+    for root in roots:
+        if root.is_dir():
+            for d in sorted(root.iterdir()):
+                if d.is_dir():
+                    out.setdefault(d.name, root)
+    return out
+
+
+def fingerprint(root: Path | list[Path]) -> str:
     """Changes whenever a result, log or evidence file lands or grows."""
     h = hashlib.sha1()
-    for path in sorted(root.glob("*/*.json")) + sorted(root.glob("*/logs/*.log")):
-        try:
-            st = path.stat()
-        except OSError:
-            continue
-        h.update(f"{path.relative_to(root)}:{st.st_mtime_ns}:{st.st_size}".encode())
+    for r in as_roots(root):
+        for path in sorted(r.glob("*/*.json")) + sorted(r.glob("*/logs/*.log")):
+            try:
+                st = path.stat()
+            except OSError:
+                continue
+            h.update(f"{r}:{path.relative_to(r)}:{st.st_mtime_ns}:{st.st_size}".encode())
     return h.hexdigest()[:16]
 
 
@@ -229,6 +250,7 @@ def compact(record: dict, root: Path) -> dict:
                                              "rule_matched", "active_unit")},
         "started_at": record.get("started_at"), "duration_s": record.get("duration_s"),
         "git_sha": record.get("git_sha"),
+        "build": record.get("build"),
         "signature": sig,
         "key_lines": key_lines(edir, sig) if red else [],
         "evidence": [{"name": n, "bytes": f["bytes"], "lines": f["lines"], "sha256": f["sha256"]}
@@ -280,15 +302,21 @@ def expected_cells(qual_path: Path, matrix_path: Path) -> list[str]:
         return []
 
 
-def build_state(root: Path = RESULTS, qual_path: Path = REPO / "qualification.yaml",
+def build_state(root: Path | list[Path] = RESULTS, qual_path: Path = REPO / "qualification.yaml",
                 matrix_path: Path = REPO / "matrix.yaml", now: float | None = None) -> dict:
     now = now or time.time()
-    records = load_records(root)
+    roots = as_roots(root)
+    owner = owners(roots)
+    records, cells, running = [], [], []
+    for r_root in roots:
+        mine = [r for r in load_records(r_root) if owner.get(r["version"]) == r_root]
+        records += mine
+        cells += [compact(r, r_root) for r in mine]
+        running += [r for r in running_cells(r_root, now) if owner.get(r["version"]) == r_root]
     flat = [{"version": r["version"], "distro": r["distro"], "kernel": r["kernel"],
-             "scenario": r["scenario"]["id"], "status": r["status"], "reason": r["reason"]}
+             "scenario": r["scenario"]["id"], "status": r["status"], "reason": r["reason"],
+             "channel": r["channel"]}
             for r in records]
-    cells = [compact(r, root) for r in records]
-    running = running_cells(root, now)
     versions = sorted({c["version"] for c in cells} | {r["version"] for r in running},
                       key=qualify.version_key)
     per_version = {}
@@ -298,8 +326,11 @@ def build_state(root: Path = RESULTS, qual_path: Path = REPO / "qualification.ya
         counts: dict[str, int] = {}
         for c in vcells:
             counts[c["status"]] = counts.get(c["status"], 0) + 1
+        build = next((c["build"] for c in vcells if c.get("build")), None)
         per_version[v] = {
-            "channel": qualify.channel(v),
+            # The cells say what they were; the plan only knows its own builds.
+            "channel": vcells[0]["channel"] if vcells else qualify.channel(v),
+            "build": build and {k: build.get(k) for k in ("label", "base", "source", "patch")},
             "gate": {k: g[k] for k in ("new", "known", "fixed", "cells")},
             "counts": counts,
             "running": sum(1 for r in running if r["version"] == v),
@@ -321,7 +352,7 @@ def build_state(root: Path = RESULTS, qual_path: Path = REPO / "qualification.ya
     return {
         "schema_version": 1,
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
-        "fingerprint": fingerprint(root),
+        "fingerprint": fingerprint(roots),
         "versions": versions,
         "targets": [{"distro": d, "kernel": k} for d, k in targets],
         "scenarios": scenario_order,
@@ -354,9 +385,12 @@ def export_fragment(state: dict) -> str:
                                    f"<script>window.KESTREL_SNAPSHOT = {data};</script>", 1)
 
 
-def resolve_evidence(root: Path, version: str, cell: str, name: str) -> Path | None:
+def resolve_evidence(root: Path | list[Path], version: str, cell: str, name: str) -> Path | None:
     """A served file must be one the cell's own manifest lists, or its log."""
     if not re.fullmatch(r"[0-9A-Za-z.+_-]+", version) or not re.fullmatch(r"[0-9A-Za-z._-]+", cell):
+        return None
+    root = owners(as_roots(root)).get(version)
+    if root is None:
         return None
     vdir = root / version
     if name == "console.log":
@@ -376,7 +410,7 @@ def resolve_evidence(root: Path, version: str, cell: str, name: str) -> Path | N
 
 
 class Handler(BaseHTTPRequestHandler):
-    root = RESULTS
+    root: list[Path] = [RESULTS]
     server_version = "KestrelQA/1"
 
     def log_message(self, fmt, *args):  # quieter than the default per-request line
@@ -401,7 +435,7 @@ class Handler(BaseHTTPRequestHandler):
         if parts == ["api", "state"]:
             since = parse_qs(url.query).get("since", [""])[0]
             fp = fingerprint(self.root)
-            if since and since == fp and not running_cells(self.root, time.time()):
+            if since and since == fp and not any(running_cells(r, time.time()) for r in self.root):
                 return self.send(200, b'{"unchanged":true}', "application/json")
             body = json.dumps({**build_state(self.root), "mode": "live"}).encode()
             return self.send(200, body, "application/json")
@@ -422,17 +456,20 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="Kestrel QA dashboard for qualify.py results")
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=8099)
-    ap.add_argument("--results", type=Path, default=RESULTS)
+    ap.add_argument("--results", type=Path, action="append",
+                    help=f"result root, repeatable; first wins per version (default {RESULTS})")
     ap.add_argument("--export", type=Path, metavar="FILE",
                     help="write a self-contained snapshot page and exit")
     args = ap.parse_args()
+    args.results = args.results or [RESULTS]
     if args.export:
         args.export.write_text(export_fragment(build_state(args.results)))
         print(f"wrote {args.export}")
         return 0
     Handler.root = args.results
     srv = ThreadingHTTPServer((args.host, args.port), Handler)
-    print(f"Kestrel QA on http://{args.host}:{args.port} reading {args.results}", flush=True)
+    print(f"Kestrel QA on http://{args.host}:{args.port} reading "
+          f"{', '.join(map(str, args.results))}", flush=True)
     srv.serve_forever()
     return 0
 

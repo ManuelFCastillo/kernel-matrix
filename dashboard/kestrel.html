@@ -166,6 +166,8 @@ table.grid { border-collapse: separate; border-spacing: 6px; width: 100%; min-wi
 .foot { color: var(--faint); font-size: 12px; display: flex; flex-wrap: wrap; gap: 6px 18px; }
 
 @media (max-width: 1100px) { .main { grid-template-columns: minmax(0, 1fr); } .tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+.branchnote { margin: 0; padding: 12px 16px; border: 1px solid var(--line); border-left: 3px solid var(--warn); border-radius: 8px; background: var(--warn-bg); font-size: 14px; line-height: 1.5; }
+.branchnote b { color: var(--warn); font-weight: 600; }
 @media (max-width: 560px) { .wrap { padding-inline: 16px; } .tiles { grid-template-columns: minmax(0, 1fr); } .field select { min-width: 0; width: 100%; } .field { flex: 1 1 100%; } .big { font-size: 34px; } }
 @media (prefers-reduced-motion: reduce) { *, *::after { animation: none !important; transition: none !important; } }
 </style>
@@ -185,6 +187,8 @@ table.grid { border-collapse: separate; border-spacing: 6px; width: 100%; min-wi
     <span class="pill" id="mode"><span class="dot"></span><span id="modeText">Loading</span></span>
     <a class="btn" id="export" href="/export" hidden>Export snapshot</a>
   </header>
+
+  <p class="branchnote" id="branchNote" hidden></p>
 
   <section class="tiles" aria-label="Summary">
     <div class="tile verdict" id="tVerdict"><span class="label">Gate verdict</span><span class="big" id="vBig">–</span><span class="sub" id="vSub"></span></div>
@@ -275,15 +279,19 @@ table.grid { border-collapse: separate; border-spacing: 6px; width: 100%; min-wi
     if (!version || !state.versions.includes(version)) {
       const hashV = (location.hash.match(/^#v_(.+)$/) || [])[1];
       const remembered = store.get("kestrel.version");
-      version = [hashV, remembered].find((v) => v && state.versions.includes(v)) || state.versions[state.versions.length - 1];
+      // The newest release, never a branch build: those are opened on purpose.
+      const releases = state.versions.filter((v) => state.per_version[v].channel !== "branch");
+      version = [hashV, remembered].find((v) => v && state.versions.includes(v))
+        || releases[releases.length - 1] || state.versions[state.versions.length - 1];
     }
     // Rebuild the options only when the release list changes: live polls
     // re-render every few seconds and would close an open dropdown.
+    const TAG = { dev: "  (pre-release)", branch: "  (fix branch, not a release)" };
     const opts = state.versions.slice().reverse().map((v) =>
-      `<option value="${esc(v)}">falco ${esc(v)}${state.per_version[v].channel === "dev" ? "  (pre-release)" : ""}</option>`).join("");
+      `<option value="${esc(v)}">falco ${esc(v)}${TAG[state.per_version[v].channel] || ""}</option>`).join("");
     if (sel.dataset.opts !== opts) { sel.innerHTML = opts; sel.dataset.opts = opts; }
     if (sel.value !== version) sel.value = version;
-    renderMode(); renderTiles(); renderGrid(); renderChecks(); renderSigs(); renderChanges(); renderFoot();
+    renderMode(); renderBranch(); renderTiles(); renderGrid(); renderChecks(); renderSigs(); renderChanges(); renderFoot();
     if (openCell) openDrawer(openCell, true);
   }
 
@@ -300,6 +308,14 @@ table.grid { border-collapse: separate; border-spacing: 6px; width: 100%; min-wi
     $("export").hidden = !LIVE;
   }
 
+  function renderBranch() {
+    const pv = state.per_version[version], b = pv.build, note = $("branchNote");
+    note.hidden = pv.channel !== "branch";
+    if (note.hidden) return;
+    note.innerHTML = `<b>Branch build, not a release.</b> The official falco ${esc(b?.base || "")} packages with ${esc(b?.patch || "a patch")} applied to their maintainer scripts; the payload is byte-identical. `
+      + `${esc(b?.source || "")} Compared cell by cell with ${esc(b?.base || "its base release")}, so the cells the fix repairs show as fixed.`;
+  }
+
   function renderTiles() {
     const pv = state.per_version[version], g = pv.gate, counts = pv.counts;
     const total = state.expected.length || g.cells;
@@ -313,7 +329,12 @@ table.grid { border-collapse: separate; border-spacing: 6px; width: 100%; min-wi
         g.known.length ? `${g.known.length} already red before` : ""].filter(Boolean).join(" · ");
     } else if (pv.running) {
       t.classList.add("running"); $("vBig").textContent = "RUNNING";
-      $("vSub").textContent = `${pv.running} cell${pv.running > 1 ? "s" : ""} on VMs now, no new red so far`;
+      $("vSub").textContent = `${pv.running} cell${pv.running > 1 ? "s" : ""} on VMs now, no new red so far`
+        + (pv.channel === "branch" && g.fixed.length ? ` · ${g.fixed.length} fixed so far` : "");
+    } else if (pv.channel === "branch") {
+      t.classList.add("clear"); $("vBig").textContent = `FIXES ${g.fixed.length}`;
+      $("vSub").textContent = [`${g.fixed.length} cell${g.fixed.length === 1 ? "" : "s"} red in ${base || "the base release"} pass${g.fixed.length === 1 ? "es" : ""} with this build`,
+        "no new red", g.known.length ? `${g.known.length} still red, as before` : "nothing left red"].join(" · ");
     } else {
       t.classList.add("clear"); $("vBig").textContent = "CLEAR";
       $("vSub").textContent = g.known.length ? `No new red. ${g.known.length} red cells already known in ${base}.` : "No red cells.";
