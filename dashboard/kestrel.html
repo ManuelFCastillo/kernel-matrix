@@ -64,6 +64,14 @@ button, select { font: inherit; color: inherit; }
 .pill.live .dot { background: var(--pass); box-shadow: 0 0 0 0 var(--pass); animation: beat 2s infinite; }
 .btn { display: inline-flex; align-items: center; gap: 8px; border: 1px solid var(--accent); color: var(--accent); background: var(--accent-bg); border-radius: 8px; padding: 7px 14px; text-decoration: none; font-weight: 500; font-size: 13px; cursor: pointer; }
 .btn:hover { background: var(--accent); color: var(--accent-ink); }
+.menu { position: relative; }
+.menu > summary { list-style: none; user-select: none; }
+.menu > summary::-webkit-details-marker { display: none; }
+.menu[open] > summary { background: var(--accent); color: var(--accent-ink); }
+.menu-list { position: absolute; right: 0; top: calc(100% + 6px); z-index: 30; width: 300px; max-width: calc(100vw - 32px); background: var(--panel); border: 1px solid var(--line); border-radius: 10px; box-shadow: var(--shadow); padding: 6px; display: grid; gap: 2px; }
+.menu-list a { display: grid; gap: 2px; padding: 9px 11px; border-radius: 7px; color: var(--fg); text-decoration: none; font-size: 13.5px; font-weight: 500; }
+.menu-list a:hover, .menu-list a:focus-visible { background: var(--accent-bg); outline: none; }
+.menu-list small { color: var(--muted); font-weight: 400; font-size: 12px; line-height: 1.4; }
 @keyframes beat { 0% { box-shadow: 0 0 0 0 rgba(46,196,168,.55); } 70% { box-shadow: 0 0 0 7px rgba(46,196,168,0); } 100% { box-shadow: 0 0 0 0 rgba(46,196,168,0); } }
 
 /* --- tiles ------------------------------------------------------------- */
@@ -168,7 +176,40 @@ table.grid { border-collapse: separate; border-spacing: 6px; width: 100%; min-wi
 @media (max-width: 1100px) { .main { grid-template-columns: minmax(0, 1fr); } .tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 .branchnote { margin: 0; padding: 12px 16px; border: 1px solid var(--line); border-left: 3px solid var(--warn); border-radius: 8px; background: var(--warn-bg); font-size: 14px; line-height: 1.5; }
 .branchnote b { color: var(--warn); font-weight: 600; }
-@media (max-width: 560px) { .wrap { padding-inline: 16px; } .tiles { grid-template-columns: minmax(0, 1fr); } .field select { min-width: 0; width: 100%; } .field { flex: 1 1 100%; } .big { font-size: 34px; } }
+@media (max-width: 560px) { .top { position: relative; } .menu { position: static; } .menu-list { left: 0; right: 0; width: auto; max-width: none; } .wrap { padding-inline: 16px; } .tiles { grid-template-columns: minmax(0, 1fr); } .field select { min-width: 0; width: 100%; } .field { flex: 1 1 100%; } .big { font-size: 34px; } }
+/* --- print: the PDF export, and Cmd+P on the live page ------------------
+   Light on white whatever the screen theme, one landscape page wide, the
+   grid and signatures unclipped, nothing interactive. */
+@page { size: letter landscape; margin: 10mm; }
+@media print {
+  :root, :root:not([data-theme="light"]), :root[data-theme="dark"] {
+    --bg: #ffffff; --panel: #ffffff; --panel-2: #f5f8fb; --line: #d6e1ec;
+    --fg: #0f2133; --muted: #4f667e; --faint: #7d93a9;
+    --accent: #0b86b3; --accent-ink: #ffffff;
+    --pass: #0f8f78; --fail: #cc2f4b; --warn: #a86b00; --err: #6b4fd8; --idle: #6b7f96;
+    --pass-bg: rgba(15,143,120,.12); --fail-bg: rgba(204,47,75,.12); --warn-bg: rgba(168,107,0,.12);
+    --err-bg: rgba(107,79,216,.12); --idle-bg: rgba(107,127,150,.10); --accent-bg: rgba(11,134,179,.10);
+    --shadow: none; color-scheme: light; }
+  * { -webkit-print-color-adjust: exact; print-color-adjust: exact; animation: none !important; transition: none !important; }
+  body { background: #fff; font-size: 12.5px; }
+  .wrap { max-width: none; padding: 0; gap: 12px; }
+  .menu, .scrim, .drawer { display: none !important; }
+  .field select { appearance: none; -webkit-appearance: none; border: 0; padding: 0; background: none; min-width: 0; font-size: 15px; font-weight: 500; }
+  .pill .dot { display: none; }
+  .tiles { grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
+  .main { grid-template-columns: minmax(0, 1fr); gap: 12px; }
+  .col { gap: 12px; }
+  .tile, .sig, .chk, .branchnote, .changes li { break-inside: avoid; }
+  .panel > header { break-after: avoid; }
+  .gridwrap { overflow: visible; }
+  table.grid { min-width: 0; }
+  .grid th.row { position: static; }
+  .cell { cursor: auto; min-height: 36px; }
+  .cell.sel { outline: none; }
+  .cell.s-running::after { display: none; }
+  .cite { white-space: pre-wrap; overflow-wrap: anywhere; overflow: visible; }
+  a { color: inherit; text-decoration: none; }
+}
 @media (prefers-reduced-motion: reduce) { *, *::after { animation: none !important; transition: none !important; } }
 </style>
 <!--KESTREL_DATA-->
@@ -185,7 +226,14 @@ table.grid { border-collapse: separate; border-spacing: 6px; width: 100%; min-wi
     </div>
     <label class="field" for="version"><span class="label">Release</span><select id="version"></select></label>
     <span class="pill" id="mode"><span class="dot"></span><span id="modeText">Loading</span></span>
-    <a class="btn" id="export" href="/export" hidden>Export snapshot</a>
+    <details class="menu" id="export" hidden>
+      <summary class="btn" aria-haspopup="menu">Export <span aria-hidden="true">▾</span></summary>
+      <div class="menu-list" role="menu">
+        <a role="menuitem" href="/export">HTML snapshot<small>The whole dashboard, every release. Opens from disk, no server, does not update.</small></a>
+        <a role="menuitem" href="/export.json">JSON data<small>Every release's cells, gates and failure signatures, for scripts.</small></a>
+        <a role="menuitem" id="exportPdf" href="/export.pdf">PDF report<small id="exportPdfSub">The release shown now, ready to print or attach.</small></a>
+      </div>
+    </details>
   </header>
 
   <p class="branchnote" id="branchNote" hidden></p>
@@ -306,6 +354,9 @@ table.grid { border-collapse: separate; border-spacing: 6px; width: 100%; min-wi
       $("modeText").textContent = `Snapshot · ${fmtTime(state.generated_at)}`;
     }
     $("export").hidden = !LIVE;
+    // The PDF prints one release: the one on screen.
+    $("exportPdf").href = `/export.pdf?version=${encodeURIComponent(version)}`;
+    $("exportPdfSub").textContent = `falco ${version}, ready to print or attach.`;
   }
 
   function renderBranch() {
@@ -466,7 +517,12 @@ table.grid { border-collapse: separate; border-spacing: 6px; width: 100%; min-wi
 
   // --- events ----------------------------------------------------------------
   document.addEventListener("click", (e) => { const t = e.target.closest("[data-cell]"); if (t) openDrawer(t.dataset.cell); });
+  // The export menu closes on a choice, a click elsewhere, or Escape.
+  const menu = $("export");
+  menu.querySelectorAll("a").forEach((a) => a.addEventListener("click", () => { menu.open = false; }));
+  document.addEventListener("click", (e) => { if (menu.open && !menu.contains(e.target)) menu.open = false; });
   document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && menu.open) { menu.open = false; menu.querySelector("summary").focus(); return; }
     if (e.key === "Escape" && openCell) closeDrawer();
     if ((e.key === "Enter" || e.key === " ") && e.target.matches?.(".cell[data-cell]")) { e.preventDefault(); openDrawer(e.target.dataset.cell); }
   });

@@ -12,6 +12,11 @@ owns.
     python3 dashboard/server.py --export kestrel.html  # frozen snapshot page
     python3 dashboard/server.py --results A --results B  # several result roots
 
+The page's Export menu downloads the same data three ways: /export (the
+snapshot page as a standalone .html), /export.json (the state, every
+release) and /export.pdf?version=V (one release, printed by headless Chrome
+from the snapshot page with the page's print styles).
+
 Several --results roots show as one grid, so the grid of record (the Jenkins
 workspace) and a hand-run branch build sit in the same Release picker. Each
 version is read from the first root that has it.
@@ -39,12 +44,15 @@ import hashlib
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
+import tempfile
 import time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent
@@ -385,6 +393,43 @@ def export_fragment(state: dict) -> str:
                                    f"<script>window.KESTREL_SNAPSHOT = {data};</script>", 1)
 
 
+CHROMES = ("google-chrome-stable", "google-chrome", "chromium", "chromium-browser")
+
+
+def find_chrome() -> str | None:
+    found = os.environ.get("KESTREL_CHROME")
+    return found if found else next((c for c in map(shutil.which, CHROMES) if c), None)
+
+
+def pdf_command(chrome: str, page: Path, version: str, out: Path, profile: Path) -> list[str]:
+    """Headless Chrome printing the snapshot page open on one release. The
+    page picks the release from #v_<version>; the virtual time budget lets
+    its script render and the web fonts arrive before the print.
+    --password-store=basic: otherwise Chrome asks the desktop keyring over
+    D-Bus and, with no keyring in the service's session, waits out D-Bus's
+    25 s timeout on every PDF (0.6 s with it, same bytes)."""
+    url = page.as_uri() + "#v_" + quote(version, safe="+._-")
+    return [chrome, "--headless=new", "--disable-gpu", "--no-first-run", "--no-default-browser-check",
+            "--password-store=basic", "--disable-background-networking",
+            "--hide-scrollbars", f"--user-data-dir={profile}", "--no-pdf-header-footer",
+            "--run-all-compositor-stages-before-draw", "--virtual-time-budget=5000",
+            f"--print-to-pdf={out}", url]
+
+
+def render_pdf(state: dict, version: str, timeout: int = 120) -> bytes:
+    chrome = find_chrome()
+    if not chrome:
+        raise RuntimeError("no Chrome or Chromium on this host (set KESTREL_CHROME)")
+    with tempfile.TemporaryDirectory(prefix="kestrel-pdf-") as tmp:
+        page, out = Path(tmp) / "page.html", Path(tmp) / "out.pdf"
+        page.write_text(wrap(export_fragment(state)))
+        proc = subprocess.run(pdf_command(chrome, page, version, out, Path(tmp) / "profile"),
+                              capture_output=True, text=True, timeout=timeout)
+        if not out.is_file() or out.stat().st_size == 0:
+            raise RuntimeError(f"chrome exited {proc.returncode}: {proc.stderr.strip()[-300:]}")
+        return out.read_bytes()
+
+
 def resolve_evidence(root: Path | list[Path], version: str, cell: str, name: str) -> Path | None:
     """A served file must be one the cell's own manifest lists, or its log."""
     if not re.fullmatch(r"[0-9A-Za-z.+_-]+", version) or not re.fullmatch(r"[0-9A-Za-z._-]+", cell):
@@ -439,9 +484,28 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(200, b'{"unchanged":true}', "application/json")
             body = json.dumps({**build_state(self.root), "mode": "live"}).encode()
             return self.send(200, body, "application/json")
+        stamp = time.strftime("%Y%m%d-%H%M")
+        if parts == ["export.json"]:
+            body = json.dumps({**build_state(self.root), "mode": "snapshot"}, indent=2).encode()
+            return self.send(200, body, "application/json",
+                             {"Content-Disposition": f'attachment; filename="kestrel-{stamp}.json"'})
+        if parts == ["export.pdf"]:
+            state = build_state(self.root)
+            version = parse_qs(url.query).get("version", [""])[0] or (state["versions"] or [""])[-1]
+            if version not in state["versions"]:
+                return self.send(HTTPStatus.NOT_FOUND, b"no such release\n", "text/plain")
+            try:
+                body = render_pdf(state, version)
+            except (RuntimeError, subprocess.TimeoutExpired) as exc:
+                return self.send(HTTPStatus.SERVICE_UNAVAILABLE, f"PDF failed: {exc}\n".encode(), "text/plain")
+            name = re.sub(r"[^0-9A-Za-z._-]", "_", version)
+            return self.send(200, body, "application/pdf",
+                             {"Content-Disposition": f'attachment; filename="kestrel-{name}-{stamp}.pdf"'})
         if parts == ["export"]:
-            body = export_fragment(build_state(self.root)).encode()
-            stamp = time.strftime("%Y%m%d-%H%M")
+            # A download is opened from disk, where nothing adds the document
+            # skeleton the artifact host would: without <meta charset> the
+            # browser reads the UTF-8 as Latin-1 and renders in quirks mode.
+            body = wrap(export_fragment(build_state(self.root))).encode()
             return self.send(200, body, "text/html; charset=utf-8",
                              {"Content-Disposition": f'attachment; filename="kestrel-{stamp}.html"'})
         if len(parts) == 4 and parts[0] == "evidence":

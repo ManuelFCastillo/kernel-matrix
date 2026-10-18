@@ -277,3 +277,29 @@ def test_page_has_a_title_and_one_data_slot():
     page = server.page_fragment()
     assert page.startswith("<title>Kestrel QA</title>")
     assert page.count("<!--KESTREL_DATA-->") == 1
+
+
+# ---------------------------------------------------------------------------
+# export menu: HTML, JSON, PDF
+# ---------------------------------------------------------------------------
+
+def test_pdf_opens_the_snapshot_on_the_asked_release(tmp_path):
+    cmd = server.pdf_command("chrome", tmp_path / "page.html", "0.45.1-rc1+fix-postinst-printenv",
+                             tmp_path / "out.pdf", tmp_path / "profile")
+    # The page reads #v_<version> raw: a '+' escaped to %2B would pick no release.
+    assert cmd[-1].endswith("page.html#v_0.45.1-rc1+fix-postinst-printenv")
+    assert f"--print-to-pdf={tmp_path / 'out.pdf'}" in cmd and "--no-pdf-header-footer" in cmd
+    assert "--password-store=basic" in cmd          # else a 25 s D-Bus keyring wait per PDF
+
+
+def test_page_has_print_styles_and_an_export_menu():
+    page = server.page_fragment()
+    assert "@media print" in page and "@page" in page
+    for href in ('href="/export"', 'href="/export.json"', 'href="/export.pdf"'):
+        assert href in page
+
+
+@pytest.mark.skipif(not server.find_chrome(), reason="no Chrome on this host")
+def test_pdf_renders_a_real_pdf(grid):
+    pdf = server.render_pdf(build(grid), "0.45.0")
+    assert pdf.startswith(b"%PDF-") and len(pdf) > 10_000
