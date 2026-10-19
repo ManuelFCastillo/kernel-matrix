@@ -9,6 +9,44 @@ Built as a learning project to answer a question properly rather than
 theoretically: *how do you test software across dozens of distro and kernel
 combinations?*
 
+On top of the lab sits **Kestrel QA**, a release-qualification gate for Falco's packages.
+
+---
+
+## Kestrel QA
+
+The kernel matrix asks "does Falco run on this kernel?". Kestrel QA asks the release
+question: **should this package ship?** It installs Falco's real `.deb` and `.rpm` through
+the package manager, maintainer scripts and all, on real VMs, and decides from what each
+VM reports.
+
+| Part | What it does | Where |
+|---|---|---|
+| The grid | every version, distro/kernel target and install scenario (fresh auto, fresh kmod, fresh modern_ebpf, upgrade from N-1), four checks per cell, all decided by code | [`qualify.py`](qualify.py), [`qualification.yaml`](qualification.yaml) |
+| The gate | a nightly Jenkins job finds new release candidates in Falco's dev repo, runs the grid, and fails only on red cells that are new against the previous release | [`Jenkinsfile.qualify`](Jenkinsfile.qualify), `qualify.py --gate` |
+| Branch builds | a packaging fix on the grid before it merges: the official packages with only the fix's maintainer-script diff applied, payload unchanged, provenance recorded | [`build_branch_package.sh`](build_branch_package.sh), `builds:` in `qualification.yaml` |
+| The live view | a dashboard that fills in as each VM finishes: gate verdict, failure signatures that cite the evidence line, per-cell evidence, export to HTML, JSON or PDF | [`dashboard/`](dashboard/) |
+
+**What it caught.** Falco 0.45.0 and 0.45.1-rc1 leave Ubuntu 20.04 on its stock 5.4 kernel
+half-configured on every fresh install, with no error printed. The regression came in with
+falcosecurity/falco#3994: a `set -e` at the top of the postinst now covers a bare
+`falcoctl driver printenv` that fails on kernels without modern eBPF. Upgrades from 0.44.1
+pass on the same host, which is why testing the upgrade path did not show it. The fix,
+falcosecurity/falco#4037, ran on the grid as a branch build before it was opened: 0.45.1-rc1
+went from 34 pass, 13 fail and 1 blocked to 36 pass, 9 fail, 2 unsupported and 1 blocked,
+with no new red and four cells fixed. How the first grid found it, cell by cell, is in
+[`QUALIFICATION.md`](QUALIFICATION.md).
+
+**Verdicts are code.** Every pass or fail comes from the four deterministic checks, and the
+gate compares each cell with the same cell in the previous release. Failure signatures are
+known patterns matched against a cell's own evidence. Model-assisted triage is evaluated
+separately, against faults injected into real VMs. If it comes here, it will be advisory
+only: a labelled hypothesis on red cells that no signature explains, citing the evidence
+lines it used, and never an input to the verdict.
+
+The sections below cover the lab first, then [package qualification](#package-qualification)
+in detail.
+
 ---
 
 ## Why virtual machines and not containers
@@ -179,8 +217,8 @@ question instead: does the actual `.deb`/`.rpm` install through the package mana
 its maintainer scripts running, on real distro kernels, in every way a fleet installs it?
 
 Upstream's package tests extract the tarball with `cp -r * /`, so `postinst` never runs
-in CI. falcosecurity/falco#3994 (0.45.0 fresh installs fail on kernels without modern
-eBPF) shipped through exactly that gap, days after 0.45.0-rc3 and rc4 sat in the dev repo.
+in CI. The regression from falcosecurity/falco#3994 (0.45.0 fresh installs fail on
+kernels without modern eBPF; fix in falcosecurity/falco#4037) shipped through exactly that gap, days after 0.45.0-rc3 and rc4 sat in the dev repo.
 
 ```bash
 python3 qualify.py --dry-run                     # plan, and check every package URL exists
@@ -249,7 +287,7 @@ python3 qualify.py --gate 0.45.1-rc1             # exit 1 only on red cells that
 ```
 
 The gate compares each cell with the same distro, kernel and scenario in the newest earlier
-version that ran it. Red before and red now is `known` and keeps the build green (#3994 on
+version that ran it. Red before and red now is `known` and keeps the build green (the #3994 regression on
 18.04/20.04 would otherwise fail every night); green, blocked, unsupported or never run
 before and red now is `new` and fails it; red before and green now is `fixed`. The verdict
 is written to `results/qualification/<version>/gate.json` and archived with the grid.
