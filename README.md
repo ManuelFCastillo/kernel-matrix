@@ -15,6 +15,11 @@ On top of the lab sits **Kestrel QA**, a release-qualification gate for Falco's 
 
 ## Kestrel QA
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/kestrel-qa-dark.png">
+  <img src="docs/kestrel-qa-light.png" alt="Kestrel QA" width="420">
+</picture>
+
 The kernel matrix asks "does Falco run on this kernel?". Kestrel QA asks the release
 question: **should this package ship?** It installs Falco's real `.deb` and `.rpm` through
 the package manager, maintainer scripts and all, on real VMs, and decides from what each
