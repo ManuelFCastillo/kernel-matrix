@@ -162,6 +162,21 @@ table.grid { border-collapse: separate; border-spacing: 6px; width: 100%; min-wi
 .chk .bar i { display: block; height: 100%; background: var(--pass); }
 .chk .n { font-family: var(--f-mono); font-size: 12.5px; color: var(--muted); }
 
+/* --- sensor suite: informational, beside the gate ----------------------- */
+.chip.green { background: var(--pass-bg); color: var(--pass); }
+.sensor { display: grid; gap: 12px; padding: 0 18px 18px; min-width: 0; }
+.sensor .sum { font-size: 13px; color: var(--muted); }
+.sensor .sum b { color: var(--fg); font-weight: 600; }
+.tabwrap { overflow-x: auto; }
+.sentab { width: 100%; border-collapse: collapse; font-size: 12.5px; min-width: 420px; }
+.sentab th { text-align: left; font-weight: 500; font-size: 11.5px; color: var(--muted); padding: 4px; }
+.sentab td { padding: 6px 4px; border-top: 1px solid var(--line); vertical-align: middle; }
+.sentab td.n, .sentab th.n { font-family: var(--f-mono); text-align: right; white-space: nowrap; }
+.sentab td.n { color: var(--muted); }
+.ftests { display: grid; gap: 8px; margin: 0; padding: 0; }
+.ftests li { list-style: none; display: grid; gap: 4px; min-width: 0; }
+.ftests .tn { display: flex; flex-wrap: wrap; gap: 6px; align-items: baseline; font: 500 12.5px/1.4 var(--f-mono); overflow-wrap: anywhere; }
+
 .changes { padding: 0 18px 16px; display: grid; gap: 6px; font-size: 13px; }
 .changes li { list-style: none; display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
 .changes ul { margin: 0; padding: 0; display: grid; gap: 6px; }
@@ -216,7 +231,9 @@ table.grid { border-collapse: separate; border-spacing: 6px; width: 100%; min-wi
   .tiles { grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
   .main { grid-template-columns: minmax(0, 1fr); gap: 12px; }
   .col { gap: 12px; }
-  .tile, .sig, .chk, .branchnote, .changes li { break-inside: avoid; }
+  .tile, .sig, .chk, .branchnote, .changes li, .ftests li, .sentab tr { break-inside: avoid; }
+  .tabwrap { overflow: visible; }
+  .sentab { min-width: 0; }
   .panel > header { break-after: avoid; }
   .gridwrap { overflow: visible; }
   table.grid { min-width: 0; }
@@ -276,6 +293,11 @@ table.grid { border-collapse: separate; border-spacing: 6px; width: 100%; min-wi
       <section class="panel" aria-labelledby="chkTitle">
         <header><h2 id="chkTitle">Deterministic checks</h2><p>Decided by code from what each guest reported. Cells the harness could not judge are not counted.</p></header>
         <div class="checks" id="checks"></div>
+      </section>
+
+      <section class="panel" aria-labelledby="senTitle">
+        <header><h2 id="senTitle">Sensor suite</h2><span class="chip">informational</span><p>pytest on long-lived VMs after qualification: detection, containers, outputs, load, soak and lifecycle. A failure marks the Jenkins build UNSTABLE. It is not part of the gate and never changes the verdict above.</p></header>
+        <div class="sensor" id="sensor"></div>
       </section>
     </div>
 
@@ -352,7 +374,7 @@ table.grid { border-collapse: separate; border-spacing: 6px; width: 100%; min-wi
       `<option value="${esc(v)}">falco ${esc(v)}${TAG[state.per_version[v].channel] || ""}</option>`).join("");
     if (sel.dataset.opts !== opts) { sel.innerHTML = opts; sel.dataset.opts = opts; }
     if (sel.value !== version) sel.value = version;
-    renderMode(); renderBranch(); renderTiles(); renderGrid(); renderChecks(); renderSigs(); renderChanges(); renderFoot();
+    renderMode(); renderBranch(); renderTiles(); renderGrid(); renderChecks(); renderSensor(); renderSigs(); renderChanges(); renderFoot();
     if (openCell) openDrawer(openCell, true);
   }
 
@@ -456,6 +478,26 @@ table.grid { border-collapse: separate; border-spacing: 6px; width: 100%; min-wi
     }).join("") || `<p class="empty">No judged cells yet.</p>`;
   }
 
+  const cellLabel = (n) => { const [d, k, s] = n.split("--"); return k ? `${distroName(d)} ${kernelName(k)} · ${s}` : n; };
+  const SENSOR = { pass: ["green", "pass"], fail: ["red", "fail"], error: ["violet", "error"] };
+  const sensorChip = (c) => { const [cls, txt] = SENSOR[c.status] || ["", c.status]; return `<span class="chip ${cls}">${esc(txt)}</span>`; };
+  const sensorLink = (cell, f) => LIVE ? `<a href="/sensor/${encodeURIComponent(version)}/${encodeURIComponent(cell)}/${encodeURIComponent(f)}" target="_blank" rel="noopener">${esc(f)}</a>` : "";
+  const sensorOf = (name) => state.per_version[version].sensor?.cells.find((x) => x.cell === name);
+
+  function renderSensor() {
+    const sn = state.per_version[version].sensor, box = $("sensor");
+    if (!sn) { box.innerHTML = `<p class="muted" style="margin:0">No sensor run for this release. Jenkins runs sensor_tests/ after Qualify when SENSOR_TESTS is on.</p>`; return; }
+    const t = sn.totals, all = Math.max(t.tests, 1);
+    const stack = [["passed", "--pass"], ["skipped", "--idle"], ["failures", "--fail"], ["errors", "--err"]]
+      .map(([k, c]) => t[k] ? `<i style="width:${t[k] / all * 100}%;background:var(${c})" title="${k}: ${t[k]}"></i>` : "").join("");
+    const sum = `<div class="sum"><b>${t.cells_passed} of ${t.cells}</b> cells passed · <b>${t.passed} of ${t.tests}</b> tests passed, ${t.failures} failed, ${t.errors} errors, ${t.skipped} skipped · ran ${esc(fmtTime(sn.ran_at))}</div>`;
+    const name = (n) => cellsOf(version).some((c) => c.cell === n) ? `<button class="chip link" data-cell="${esc(n)}">${esc(cellLabel(n))}</button>` : esc(cellLabel(n));
+    const rows = sn.cells.map((c) => `<tr><td>${name(c.cell)}</td><td>${sensorChip(c)}</td><td class="n">${c.passed} / ${c.tests}</td><td class="n">${c.failures + c.errors}</td><td class="n">${c.skipped}</td>${LIVE ? `<td>${c.log ? sensorLink(c.cell, "pytest.log") : ""}</td>` : ""}</tr>`).join("");
+    const table = `<div class="tabwrap"><table class="sentab"><thead><tr><th>Cell</th><th>Result</th><th class="n">Passed</th><th class="n">Failed</th><th class="n">Skipped</th>${LIVE ? "<th>Log</th>" : ""}</tr></thead><tbody>${rows}</tbody></table></div>`;
+    const ft = sn.failing_tests.map((f) => `<li><div class="tn"><span class="chip ${f.kind === "error" ? "violet" : "red"}">${f.cells.length} cell${f.cells.length > 1 ? "s" : ""}</span>${esc(f.name)}</div>${f.message ? `<div class="cite">${esc(f.message)}</div>` : ""}</li>`).join("");
+    box.innerHTML = `<div class="stack">${stack}</div>${sum}${table}${ft ? `<span class="label">Failing tests</span><ul class="ftests">${ft}</ul>` : ""}`;
+  }
+
   function renderSigs() {
     const groups = state.per_version[version].groups;
     if (!groups.length) { $("sigs").innerHTML = `<p class="empty">No red cells in this release.</p>`; return; }
@@ -487,7 +529,7 @@ table.grid { border-collapse: separate; border-spacing: 6px; width: 100%; min-wi
 
   function renderFoot() {
     const vc = cellsOf(version), shas = [...new Set(vc.map((c) => c.git_sha).filter(Boolean))];
-    $("foot").innerHTML = `<span>Data ${LIVE ? "read live from" : "frozen from"} kernel-matrix results/qualification</span><span>Harness ${shas.map((s) => `<span class="mono">${esc(s.slice(0, 7))}</span>`).join(", ") || "unknown"}</span><span>Not affiliated with the Falco project or the Cloud Native Computing Foundation.</span>`;
+    $("foot").innerHTML = `<span>Data ${LIVE ? "read live from" : "frozen from"} kernel-matrix results/qualification and results/sensor</span><span>Harness ${shas.map((s) => `<span class="mono">${esc(s.slice(0, 7))}</span>`).join(", ") || "unknown"}</span><span>Not affiliated with the Falco project or the Cloud Native Computing Foundation.</span>`;
   }
 
   // --- drawer ----------------------------------------------------------------
@@ -519,10 +561,16 @@ table.grid { border-collapse: separate; border-spacing: 6px; width: 100%; min-wi
       ["Degraded", sn.bpf_load_errors ? `${sn.bpf_load_errors} BPF programs failed to load` : ""],
       ["Ran", `${fmtTime(c.started_at)} · ${Math.round((c.duration_s || 0) / 60)} min`], ["Harness", c.git_sha ? c.git_sha.slice(0, 10) : ""],
     ].filter(([, v]) => v !== "" && v != null);
+    const sc = sensorOf(name);
+    const senHtml = sc ? `<section><span class="label">Sensor suite · informational, not part of the gate</span><div class="chips">${sensorChip(sc)}<span class="chip">${sc.passed} of ${sc.tests} passed</span>${sc.failures + sc.errors ? `<span class="chip red">${sc.failures + sc.errors} failed</span>` : ""}${sc.skipped ? `<span class="chip">${sc.skipped} skipped</span>` : ""}<span class="chip">exit ${esc(sc.exit)}</span></div>`
+      + (sc.failing.length ? `<ul class="clist">${sc.failing.map((f) => `<li><span style="color:var(${f.kind === "error" ? "--err" : "--fail"})">✕</span><span class="mono" style="font-size:12.5px;overflow-wrap:anywhere">${esc(f.name)}</span><span>${esc(f.message)}</span></li>`).join("")}</ul>` : "")
+      + (sc.note ? `<p class="muted" style="margin:0">${esc(sc.note)}</p>` : "")
+      + (LIVE ? `<table class="files"><tbody>${sc.log ? `<tr><td>${sensorLink(name, "pytest.log")}</td><td></td><td>pytest output</td></tr>` : ""}<tr><td>${sensorLink(name, "junit.xml")}</td><td></td><td>JUnit</td></tr></tbody></table>` : "")
+      + `</section>` : "";
     d.innerHTML = `<div class="dhead"><div><span class="label">falco ${esc(version)} · ${esc(c.channel === "dev" ? "pre-release" : "stable")}</span><h2>${esc(distroName(c.distro))} ${esc(kernelName(c.kernel))} · ${esc(sa)} <span class="muted">${esc(sb)}</span></h2><div><span class="status s-${c.status}">${GLYPH[c.status]} ${esc(STATUS[c.status])}</span></div>${c.reason ? `<span class="muted mono" style="font-size:12.5px">${esc(c.reason)}</span>` : ""}${gateLine ? `<span style="font-size:13px">${gateLine}</span>` : ""}</div><button class="x" id="close" aria-label="Close">×</button></div>
       <section><span class="label">Checks</span>${checks}</section>${sigHtml}${triageHtml}
       <section><span class="label">Run</span><dl class="kv">${rows.map(([k, v]) => `<dt>${esc(k)}</dt><dd>${typeof v === "string" && v.startsWith("<a ") ? v : esc(v)}</dd>`).join("")}</dl></section>
-      <section><span class="label">Evidence bundle${LIVE ? "" : " (file list; open the live dashboard for contents)"}</span>${files}</section>`;
+      <section><span class="label">Evidence bundle${LIVE ? "" : " (file list; open the live dashboard for contents)"}</span>${files}</section>${senHtml}`;
     d.hidden = false; $("scrim").hidden = false; d.scrollTop = top;
     $("close").onclick = closeDrawer;
     document.querySelectorAll(".cell.sel").forEach((e) => e.classList.remove("sel"));

@@ -7,6 +7,7 @@ decided here, not in the browser.
 
 import json
 import os
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -421,3 +422,220 @@ def test_page_has_the_logo_with_a_name_and_a_print_image():
     # Masks can print as a solid block; print must swap in a plain image.
     print_css = page[page.index("@media print"):]
     assert ".logo { background: url(data:image/png" in print_css
+
+
+# ---------------------------------------------------------------------------
+# sensor suite: shown beside the gate, never part of it
+# ---------------------------------------------------------------------------
+
+JUNIT_FAIL = """<?xml version="1.0" encoding="utf-8"?>
+<testsuites name="pytest tests"><testsuite name="sensor.x" errors="1" failures="2" skipped="1" tests="6">
+<testcase classname="sensor_tests.test_00_install" name="test_install[pkg_installed]" time="1"/>
+<testcase classname="sensor_tests.test_10_detection" name="test_syscall[mount]" time="1">
+  <failure message="AssertionError: no 'KM cov mount' alert within 30s&#10;assert False">trace</failure></testcase>
+<testcase classname="sensor_tests.test_60_lifecycle" name="test_purge_leaves_nothing" time="1">
+  <failure message="&#10;#x1B[90mAssertionError: purge exited 100#x1B[0m: .&#10;  [PRE-REMOVE] Stop">trace</failure></testcase>
+<testcase classname="sensor_tests.test_30_outputs" name="test_grpc_output" time="1">
+  <error message="failed on setup with &quot;TimeoutError&quot;">trace</error></testcase>
+<testcase classname="sensor_tests.test_50_soak" name="test_soak" time="0"><skipped message="soak off"/></testcase>
+<testcase classname="sensor_tests.test_60_lifecycle" name="test_restart" time="1"/>
+</testsuite></testsuites>
+"""
+JUNIT_PURGE = """<?xml version="1.0" encoding="utf-8"?>
+<testsuites><testsuite name="sensor.y" errors="0" failures="1" skipped="0" tests="3">
+<testcase classname="sensor_tests.test_00_install" name="test_install[pkg_installed]"/>
+<testcase classname="sensor_tests.test_60_lifecycle" name="test_purge_leaves_nothing">
+  <failure message="AssertionError: left behind after purge">trace</failure></testcase>
+<testcase classname="sensor_tests.test_60_lifecycle" name="test_restart"/>
+</testsuite></testsuites>
+"""
+JUNIT_OK = """<?xml version="1.0" encoding="utf-8"?>
+<testsuites><testsuite name="sensor.z" errors="0" failures="0" skipped="0" tests="2">
+<testcase classname="sensor_tests.test_00_install" name="test_install[pkg_installed]"/>
+<testcase classname="sensor_tests.test_60_lifecycle" name="test_restart"/>
+</testsuite></testsuites>
+"""
+
+
+def write_sensor(sensor_root, version, cells):
+    """cells: {cell: (summary entry, junit text or None)}, as run.py leaves them."""
+    vdir = sensor_root / version
+    vdir.mkdir(parents=True, exist_ok=True)
+    for cell, (_, junit) in cells.items():
+        (vdir / cell).mkdir(exist_ok=True)
+        (vdir / cell / "pytest.log").write_text(f"{cell}: collected\n")
+        if junit is not None:
+            (vdir / cell / "junit.xml").write_text(junit)
+    (vdir / "summary.json").write_text(json.dumps({c: s for c, (s, _) in cells.items()}, indent=2))
+
+
+SENSOR_CELLS = {
+    "ubuntu-20.04--5.4--fresh-auto": ({"exit": 1, "tests": 6, "failures": 2, "errors": 1, "skipped": 1}, JUNIT_FAIL),
+    "ubuntu-22.04--5.15--fresh-kmod": ({"exit": 1, "tests": 3, "failures": 1, "errors": 0, "skipped": 0}, JUNIT_PURGE),
+    "debian-12--6.1--fresh-auto": ({"exit": 0, "tests": 2, "failures": 0, "errors": 0, "skipped": 0}, JUNIT_OK),
+}
+
+
+@pytest.fixture
+def results(tmp_path):
+    """A results dir as the lab lays it out: qualification/ and sensor/ side
+    by side. The grid fixture's root is tmp_path itself, whose parent is
+    shared across tests, so sensor tests get their own pair."""
+    qual = tmp_path / "results" / "qualification"
+    qual.mkdir(parents=True)
+    for rec in [record("0.45.0-rc4", "ubuntu-20.04--5.4--fresh-auto", "fail", "pkg_installed: exit 100", HALF),
+                record("0.45.0", "ubuntu-20.04--5.4--fresh-auto", "fail", "pkg_installed: exit 100", HALF),
+                record("0.45.0", "ubuntu-22.04--5.15--fresh-kmod")]:
+        write_cell(qual, rec, {"falco.txt": FALCO_TXT, "install.log": NO_DRIVER} if rec["status"] == "fail" else None)
+    write_sensor(tmp_path / "results" / "sensor", "0.45.0", SENSOR_CELLS)
+    return qual
+
+
+def test_sensor_dir_sits_beside_the_qualification_root(results):
+    assert server.sensor_dir(results) == results.parent / "sensor"
+
+
+def test_sensor_block_counts_cells_and_tests_from_summary(results):
+    sn = build(results)["per_version"]["0.45.0"]["sensor"]
+    assert sn["totals"] == {"cells": 3, "cells_passed": 1, "tests": 11, "passed": 6,
+                            "failures": 3, "errors": 1, "skipped": 1}
+    by = {c["cell"]: c for c in sn["cells"]}
+    assert by["debian-12--6.1--fresh-auto"]["status"] == "pass"
+    assert by["ubuntu-20.04--5.4--fresh-auto"]["status"] == "fail"
+    assert by["ubuntu-20.04--5.4--fresh-auto"]["passed"] == 2
+    assert (by["ubuntu-22.04--5.15--fresh-kmod"]["distro"], by["ubuntu-22.04--5.15--fresh-kmod"]["kernel"],
+            by["ubuntu-22.04--5.15--fresh-kmod"]["scenario"]) == ("ubuntu-22.04", "5.15", "fresh-kmod")
+    assert all(c["log"] for c in sn["cells"])
+    assert sn["ran_at"].endswith("Z")
+
+
+def test_sensor_failing_tests_named_from_junit_with_clean_messages(results):
+    sn = build(results)["per_version"]["0.45.0"]["sensor"]
+    cell = next(c for c in sn["cells"] if c["cell"] == "ubuntu-20.04--5.4--fresh-auto")
+    assert [(f["name"], f["kind"]) for f in cell["failing"]] == [
+        ("test_10_detection::test_syscall[mount]", "failure"),
+        ("test_60_lifecycle::test_purge_leaves_nothing", "failure"),
+        ("test_30_outputs::test_grpc_output", "error")]
+    # First non-blank line only, pytest's #x1B stand-ins for ESC removed.
+    assert cell["failing"][0]["message"] == "AssertionError: no 'KM cov mount' alert within 30s"
+    assert cell["failing"][1]["message"] == "AssertionError: purge exited 100: ."
+
+
+def test_sensor_failing_tests_roll_up_across_cells(results):
+    ft = build(results)["per_version"]["0.45.0"]["sensor"]["failing_tests"]
+    assert ft[0]["name"] == "test_60_lifecycle::test_purge_leaves_nothing"
+    assert sorted(ft[0]["cells"]) == ["ubuntu-20.04--5.4--fresh-auto", "ubuntu-22.04--5.15--fresh-kmod"]
+    assert [len(t["cells"]) for t in ft] == [2, 1, 1]
+
+
+@pytest.mark.parametrize("entry,status", [
+    ({"exit": 0, "tests": 2, "failures": 0, "errors": 0, "skipped": 0}, "pass"),
+    ({"exit": 5, "tests": 0, "failures": 0, "errors": 0, "skipped": 0}, "pass"),     # -k selected nothing
+    ({"exit": 1, "tests": 2, "failures": 1, "errors": 1, "skipped": 0}, "fail"),
+    ({"exit": 1, "tests": 2, "failures": 0, "errors": 1, "skipped": 0}, "error"),
+    ({"exit": -9, "tests": 0, "failures": 0, "errors": 0, "skipped": 0}, "error"),   # killed mid-run
+    ({"exit": 1, "tests": 0, "failures": 0, "errors": 1, "skipped": 0, "note": "no junit written"}, "error"),
+])
+def test_sensor_cell_status_follows_run_py_exit_rule(tmp_path, entry, status):
+    write_sensor(tmp_path, "0.45.0", {"debian-12--6.1--fresh-auto": (entry, None)})
+    cell = server.sensor_block(tmp_path, "0.45.0")["cells"][0]
+    assert cell["status"] == status and cell["failing"] == []
+    assert cell["note"] == entry.get("note")
+
+
+def test_sensor_never_changes_the_gate(results):
+    with_sensor = build(results)["per_version"]
+    shutil.rmtree(results.parent / "sensor")
+    without = build(results)["per_version"]
+    assert without["0.45.0"]["sensor"] is None
+    for v in without:
+        assert {k: x for k, x in with_sensor[v].items() if k != "sensor"} == \
+               {k: x for k, x in without[v].items() if k != "sensor"}
+    # A red sensor run on a version whose gate is clear stays clear.
+    assert with_sensor["0.45.0"]["gate"]["new"] == []
+
+
+def test_sensor_missing_or_half_written_is_none_not_fatal(results):
+    s = build(results)
+    assert s["per_version"]["0.45.0-rc4"]["sensor"] is None
+    (results.parent / "sensor" / "0.45.0" / "summary.json").write_text('{"ubuntu-20.04--5.4--fre')
+    assert build(results)["per_version"]["0.45.0"]["sensor"] is None
+    write_sensor(results.parent / "sensor", "0.45.0", {"debian-12--6.1--fresh-auto": SENSOR_CELLS["debian-12--6.1--fresh-auto"]})
+    (results.parent / "sensor" / "0.45.0" / "debian-12--6.1--fresh-auto" / "junit.xml").write_text("<testsuites><test")
+    cell = build(results)["per_version"]["0.45.0"]["sensor"]["cells"][0]
+    assert cell["failing"] == [] and cell["status"] == "pass"
+
+
+def test_sensor_read_from_first_root_that_has_it(tmp_path):
+    # Jenkins qualified the version; the sensor run was by hand in a clone.
+    jenkins, clone = tmp_path / "ws" / "results" / "qualification", tmp_path / "km" / "results" / "qualification"
+    write_cell(jenkins, record("0.45.0", "debian-12--6.1--fresh-auto"))
+    clone.mkdir(parents=True)
+    write_sensor(clone.parent / "sensor", "0.45.0", {"debian-12--6.1--fresh-auto": SENSOR_CELLS["debian-12--6.1--fresh-auto"]})
+    roots = [jenkins, clone]
+    plan = dict(qual_path=tmp_path / "missing.yaml", matrix_path=tmp_path / "missing.yaml")
+    s = server.build_state(roots, **plan)
+    assert s["per_version"]["0.45.0"]["sensor"]["totals"]["cells"] == 1
+    assert server.resolve_sensor(roots, "0.45.0", "debian-12--6.1--fresh-auto", "pytest.log") \
+        == clone.parent / "sensor" / "0.45.0" / "debian-12--6.1--fresh-auto" / "pytest.log"
+    write_sensor(jenkins.parent / "sensor", "0.45.0", {"ubuntu-20.04--5.4--fresh-auto": SENSOR_CELLS["ubuntu-20.04--5.4--fresh-auto"]})
+    assert [c["cell"] for c in server.build_state(roots, **plan)["per_version"]["0.45.0"]["sensor"]["cells"]] \
+        == ["ubuntu-20.04--5.4--fresh-auto"]
+
+
+def test_resolve_sensor_serves_listed_cells_log_and_junit_only(results):
+    r, cell = server.resolve_sensor, "ubuntu-20.04--5.4--fresh-auto"
+    vdir = results.parent / "sensor" / "0.45.0"
+    (vdir / cell / "measurements.json").write_text("{}")
+    (vdir / "rocky-9--5.14--fresh-auto").mkdir()
+    (vdir / "rocky-9--5.14--fresh-auto" / "pytest.log").write_text("not in the summary")
+    assert r(results, "0.45.0", cell, "pytest.log") == vdir / cell / "pytest.log"
+    assert r(results, "0.45.0", cell, "junit.xml") == vdir / cell / "junit.xml"
+    assert r(results, "0.45.0", cell, "measurements.json") is None
+    assert r(results, "0.45.0", cell, "../../summary.json") is None
+    assert r(results, "0.45.0", "rocky-9--5.14--fresh-auto", "pytest.log") is None
+    assert r(results, "..", cell, "pytest.log") is None
+    assert r(results, "0.45.0", "..", "pytest.log") is None
+    assert r(results, "0.45.0", f"../0.45.0/{cell}", "pytest.log") is None
+    assert r(results, "0.45.0-rc4", cell, "pytest.log") is None
+
+
+def test_fingerprint_changes_when_a_sensor_run_lands(results):
+    before = server.fingerprint(results)
+    write_sensor(results.parent / "sensor", "0.45.0-rc4",
+                 {"debian-12--6.1--fresh-auto": SENSOR_CELLS["debian-12--6.1--fresh-auto"]})
+    assert server.fingerprint(results) != before
+
+
+def test_http_serves_sensor_state_and_log_as_text(results):
+    from http.server import ThreadingHTTPServer
+    from threading import Thread
+    from urllib.error import HTTPError
+    from urllib.request import urlopen
+
+    handler = type("H", (server.Handler,), {"root": [results]})
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    Thread(target=srv.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{srv.server_address[1]}"
+    try:
+        state = json.loads(urlopen(base + "/api/state").read())
+        assert state["per_version"]["0.45.0"]["sensor"]["totals"]["cells_passed"] == 1
+        resp = urlopen(base + "/sensor/0.45.0/ubuntu-20.04--5.4--fresh-auto/junit.xml")
+        assert resp.headers["Content-Type"].startswith("text/plain") and b"<testsuites" in resp.read()
+        with pytest.raises(HTTPError) as err:
+            urlopen(base + "/sensor/0.45.0/ubuntu-20.04--5.4--fresh-auto/..%2F..%2Fsummary.json")
+        assert err.value.code == 404
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_page_shows_the_sensor_suite_as_informational():
+    page = server.page_fragment()
+    panel = page[page.index('<h2 id="senTitle">'):]
+    panel = panel[:panel.index("</section>")]
+    assert "informational" in panel and "not part of the gate" in panel and "UNSTABLE" in panel
+    assert "renderSensor()" in page and "/sensor/${encodeURIComponent(version)}" in page
+    # The verdict tile reads the gate only.
+    tiles = page[page.index("function renderTiles()"):page.index("function cellAt(")]
+    assert "sensor" not in tiles

@@ -22,8 +22,8 @@ workspace) and a hand-run branch build sit in the same Release picker. Each
 version is read from the first root that has it.
 
 Read-only by construction. The only files it serves are cell results, cell
-logs and the files a cell's evidence manifest lists, each resolved against
-the cell it belongs to.
+logs, the files a cell's evidence manifest lists, and a sensor cell's
+pytest.log and junit.xml, each resolved against the cell it belongs to.
 
 What the page shows, and where each number comes from:
 
@@ -35,6 +35,10 @@ What the page shows, and where each number comes from:
                 own evidence, with the file and line that matched. Cells with
                 the same signature are one failure, not many
     evidence    the manifest qualify.py wrote (sha256 per file), served as is
+    sensor      sensor_tests/run.py's summary.json and each cell's junit.xml,
+                from the results/sensor dir beside each qualification root.
+                Informational: a failure marks the Jenkins build UNSTABLE and
+                never enters the gate
     triage      advisory: a model's one-sentence cause for a red cell, read
                 from kestrel-triage/1 files (<triage root>/<version>/<cell>.json).
                 Shown only when every citation is a real line of the bundle
@@ -54,6 +58,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import xml.etree.ElementTree as ET
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -234,12 +239,14 @@ def fingerprint(root: Path | list[Path], triage: list[Path] = ()) -> str:
     """Changes whenever a result, log, evidence or triage file lands or grows."""
     h = hashlib.sha1()
     for r in as_roots(root):
-        for path in sorted(r.glob("*/*.json")) + sorted(r.glob("*/logs/*.log")):
+        sdir = sensor_dir(r)
+        for path in (sorted(r.glob("*/*.json")) + sorted(r.glob("*/logs/*.log"))
+                     + sorted(sdir.glob("*/summary.json")) + sorted(sdir.glob("*/*/junit.xml"))):
             try:
                 st = path.stat()
             except OSError:
                 continue
-            h.update(f"{r}:{path.relative_to(r)}:{st.st_mtime_ns}:{st.st_size}".encode())
+            h.update(f"{path}:{st.st_mtime_ns}:{st.st_size}".encode())
     for t in triage:
         for path in sorted(t.glob("*/*.json")):
             try:
@@ -374,6 +381,94 @@ def expected_cells(qual_path: Path, matrix_path: Path) -> list[str]:
         return []
 
 
+# ---------------------------------------------------------------------------
+# Sensor suite: sensor_tests/run.py's results, shown beside the gate
+# ---------------------------------------------------------------------------
+# run.py writes results/sensor/<version>/summary.json (one entry per cell)
+# and <cell>/junit.xml + pytest.log. A failure marks the Jenkins build
+# UNSTABLE; nothing here feeds qualify.gate().
+SENSOR_FILES = ("pytest.log", "junit.xml")
+_JUNIT_ESC = re.compile(r"#x1B\[[0-9;]*[A-Za-z]")    # pytest's stand-in for ESC in XML
+
+
+def sensor_dir(root: Path) -> Path:
+    """results/sensor, beside a results/qualification root."""
+    return root.parent / "sensor"
+
+
+def sensor_owners(roots: list[Path]) -> dict[str, Path]:
+    """Version -> the sensor dir it is read from: the first with a summary.
+    Independent of the qualification owner: a version qualified by Jenkins
+    can have its sensor run in a hand-run clone."""
+    out: dict[str, Path] = {}
+    for root in roots:
+        sdir = sensor_dir(root)
+        if sdir.is_dir():
+            for d in sorted(sdir.iterdir()):
+                if (d / "summary.json").is_file():
+                    out.setdefault(d.name, sdir)
+    return out
+
+
+def junit_failures(path: Path) -> list[dict]:
+    """Failed and errored tests in one junit.xml, with each message's first line."""
+    try:
+        tree = ET.parse(path).getroot()
+    except (OSError, ET.ParseError):
+        return []
+    out = []
+    for tc in tree.iter("testcase"):
+        bad = next((ch for ch in tc if ch.tag in ("failure", "error")), None)
+        if bad is None:
+            continue
+        module = (tc.get("classname") or "").rsplit(".", 1)[-1]
+        text = _JUNIT_ESC.sub("", bad.get("message") or bad.text or "")
+        first = next((clean(l) for l in text.splitlines() if l.strip()), "")
+        out.append({"name": f"{module}::{tc.get('name')}" if module else tc.get("name"),
+                    "kind": bad.tag, "message": first[:240]})
+    return out
+
+
+def sensor_block(sdir: Path, version: str) -> dict | None:
+    """One version's sensor run: per cell, totals, and failing tests by name."""
+    vdir = sdir / version
+    try:
+        summary = json.loads((vdir / "summary.json").read_text())
+        ran_at = (vdir / "summary.json").stat().st_mtime
+    except (OSError, json.JSONDecodeError):
+        return None                      # mid-write: next poll gets it
+    if not isinstance(summary, dict):
+        return None
+    cells = []
+    for name, s in sorted(summary.items()):
+        if not isinstance(s, dict) or not re.fullmatch(r"[0-9A-Za-z._-]+", name):
+            continue
+        n = {k: int(s.get(k) or 0) for k in ("tests", "failures", "errors", "skipped")}
+        # run.py's own exit rule: pytest's 5 is "no tests collected", not a failure.
+        status = ("fail" if n["failures"] else
+                  "error" if n["errors"] or s.get("exit") not in (0, 5) else "pass")
+        parts = name.split("--")
+        cells.append({"cell": name, **dict(zip(("distro", "kernel", "scenario"),
+                                               parts if len(parts) == 3 else (None,) * 3)),
+                      "exit": s.get("exit"), **n,
+                      "passed": max(0, n["tests"] - n["failures"] - n["errors"] - n["skipped"]),
+                      "status": status, "note": s.get("note"),
+                      "failing": junit_failures(vdir / name / "junit.xml"),
+                      "log": (vdir / name / "pytest.log").is_file()})
+    tests: dict[str, dict] = {}
+    for c in cells:
+        for f in c["failing"]:
+            t = tests.setdefault(f["name"], {**f, "cells": []})
+            t["cells"].append(c["cell"])
+    totals = {k: sum(c[k] for c in cells) for k in ("tests", "passed", "failures", "errors", "skipped")}
+    return {
+        "ran_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ran_at)),
+        "cells": cells,
+        "totals": {"cells": len(cells), "cells_passed": sum(c["status"] == "pass" for c in cells), **totals},
+        "failing_tests": sorted(tests.values(), key=lambda t: (-len(t["cells"]), t["name"])),
+    }
+
+
 def build_state(root: Path | list[Path] = RESULTS, qual_path: Path = REPO / "qualification.yaml",
                 matrix_path: Path = REPO / "matrix.yaml", now: float | None = None,
                 triage: list[Path] | None = None) -> dict:
@@ -381,6 +476,7 @@ def build_state(root: Path | list[Path] = RESULTS, qual_path: Path = REPO / "qua
     roots = as_roots(root)
     troots = triage_roots(roots, triage)
     owner = owners(roots)
+    sensor_owner = sensor_owners(roots)
     records, cells, running = [], [], []
     for r_root in roots:
         mine = [r for r in load_records(r_root) if owner.get(r["version"]) == r_root]
@@ -412,6 +508,8 @@ def build_state(root: Path | list[Path] = RESULTS, qual_path: Path = REPO / "qua
             "checks": check_rollup(vcells),
             "baseline": sorted({r["baseline_version"] for r in g["new"] + g["known"] + g["fixed"]
                                 if r["baseline_version"]}, key=qualify.version_key),
+            # Informational, beside the gate: never read by qualify.gate().
+            "sensor": sensor_block(sensor_owner[v], v) if v in sensor_owner else None,
         }
     expected = expected_cells(qual_path, matrix_path)
     names = list(dict.fromkeys(expected + [c["cell"] for c in cells]))
@@ -520,6 +618,24 @@ def resolve_evidence(root: Path | list[Path], version: str, cell: str, name: str
     return path if path.is_file() else None
 
 
+def resolve_sensor(root: Path | list[Path], version: str, cell: str, name: str) -> Path | None:
+    """A sensor cell's pytest.log or junit.xml, for a cell its summary lists."""
+    if name not in SENSOR_FILES or not re.fullmatch(r"[0-9A-Za-z.+_-]+", version) \
+            or not re.fullmatch(r"[0-9A-Za-z._-]+", cell):
+        return None
+    sdir = sensor_owners(as_roots(root)).get(version)
+    if sdir is None:
+        return None
+    try:
+        listed = json.loads((sdir / version / "summary.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(listed, dict) or cell not in listed:
+        return None
+    path = sdir / version / cell / name
+    return path if path.is_file() else None
+
+
 class Handler(BaseHTTPRequestHandler):
     root: list[Path] = [RESULTS]
     triage: list[Path] = []          # --triage roots; results siblings are added in build_state
@@ -580,6 +696,11 @@ class Handler(BaseHTTPRequestHandler):
             if path:
                 ctype = "application/json" if path.suffix == ".json" else "text/plain; charset=utf-8"
                 return self.send(200, path.read_bytes(), ctype)
+        if len(parts) == 4 and parts[0] == "sensor":
+            path = resolve_sensor(self.root, parts[1], parts[2], parts[3])
+            if path:
+                # junit.xml too: as text, so a browser never interprets it.
+                return self.send(200, path.read_bytes(), "text/plain; charset=utf-8")
         self.send(HTTPStatus.NOT_FOUND, b"not found\n", "text/plain")
 
 
