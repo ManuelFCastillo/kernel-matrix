@@ -298,6 +298,15 @@ before and red now is `new` and fails it; red before and green now is `fixed`. T
 is written to `results/qualification/<version>/gate.json` and archived with the grid.
 Build with `VERSIONS=0.45.1-rc1` to re-run a named version.
 
+After the gate, an advisory **Triage** stage runs the triage CLI at `KM_TRIAGE` over the
+versions just qualified. It asks a model for the cause of each red cell, keeps the answer
+only if every line it cites exists in that cell's evidence bundle, and writes
+`results/triage/<version>/<cell>.json` (schema `kestrel-triage/1`, with the sha256 of the
+evidence it explains), archived with the build. It can never change the result: the gate
+uses `catchError`, so a red gate still lets Triage run, and a missing tool, an unreachable
+model or a timeout marks only the Triage stage unstable. qualify.py never reads
+`results/triage/`.
+
 ### Kestrel QA, the live view
 
 `dashboard/server.py` serves the qualification grids on port 8099 (a systemd user service
@@ -313,6 +322,7 @@ qualify.py writes are the state.
 | Failure signatures | each red cell's own evidence matched against known patterns, citing file and line; cells with the same signature are one failure |
 | Deterministic checks | the four checks rolled up across judged cells |
 | Cell drawer | checks, package sha256, kernel, Secure Boot, idle cost, and the evidence files from the manifest |
+| Model triage (advisory) | `kestrel-triage/1` files from `--triage` roots and each results root's sibling `triage/`; shown only when grounded and made from the cell's current evidence; never part of the gate, colours or counts |
 
 The evidence route serves only files a cell's manifest lists. **Export snapshot** (or
 `python3 dashboard/server.py --export kestrel.html`) freezes the current state into one
@@ -367,7 +377,7 @@ report.py            results.json -> self-contained HTML; archives every run,
 push_metrics.py      results.json -> Prometheus Pushgateway
 xray_import.py       JUnit -> Jira/Xray, one environment per kernel
 Jenkinsfile          preflight -> lint -> parallel matrix -> publish
-Jenkinsfile.qualify  nightly: discover new Falco RCs -> qualify -> gate on new red cells
+Jenkinsfile.qualify  nightly: discover new Falco RCs -> qualify -> gate on new red cells -> advisory triage
 sensor_tests/        pytest on long-lived VMs: detection, containers, outputs, load, soak, lifecycle
 dashboard/           Kestrel QA: live qualification dashboard (server.py, kestrel.html, service unit)
 observability/       docker compose: Prometheus, Grafana, Pushgateway, nginx

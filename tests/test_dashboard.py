@@ -262,6 +262,115 @@ def test_half_written_result_is_skipped_not_fatal(grid):
     assert len(build(grid)["cells"]) == 6
 
 
+# ---------------------------------------------------------------------------
+# triage: advisory sentences beside the signature, never part of the verdict
+# ---------------------------------------------------------------------------
+
+RED_CELL = ("0.45.0", "ubuntu-20.04--5.4--fresh-auto")
+
+
+def write_triage(troot, version, cell, manifest_root, **over):
+    manifest = json.loads((manifest_root / version / "evidence" / cell / "manifest.json").read_text())
+    t = {"schema": "kestrel-triage/1", "version": version, "cell": cell, "cell_status": "fail",
+         "evidence_sha256": server.evidence_sha256(manifest), "provider": "ollama",
+         "model": "beam:cloud", "outcome": "diagnosed", "grounded": True,
+         "root_cause_code": "PACKAGE_SCRIPT_FAILED",
+         "summary": "Unguarded falcoctl driver printenv under set -e aborts configuration.",
+         "diagnosis": "The postinst exited non-zero. It runs printenv unguarded under set -e.",
+         "confidence": 0.9, "generated_at": "2026-10-19T15:57:10Z",
+         "citations": [{"ref": "falco.txt:2", "text": "ERROR no supported driver found"}]}
+    t.update(over)
+    (troot / version).mkdir(parents=True, exist_ok=True)
+    (troot / version / f"{cell}.json").write_text(json.dumps(t))
+    return t
+
+
+def triaged(grid, troot):
+    s = server.build_state(grid, qual_path=grid / "missing.yaml", matrix_path=grid / "missing.yaml",
+                           triage=[troot])
+    return s, {(c["version"], c["cell"]): c for c in s["cells"]}
+
+
+def test_evidence_digest_matches_the_triage_writer():
+    # The same vector through the writer's evidence_sha256: if either side
+    # changes how it hashes, every sentence silently disappears.
+    m = {"files": {"install.log": {"sha256": "ab" * 32}, "falco.txt": {"sha256": "cd" * 32}}}
+    assert server.evidence_sha256(m) == "575fa08f32e4336698607cddc31a39ba793feb6d18c5f7b29bb07a40c0ae74f7"
+
+
+def test_grounded_triage_shows_under_its_signature(grid, tmp_path):
+    troot = tmp_path / "tri"
+    write_triage(troot, *RED_CELL, grid)
+    write_triage(troot, "0.45.0", "ubuntu-20.04--5.4--fresh-kmod", grid)
+    s, cells = triaged(grid, troot)
+    assert cells[RED_CELL]["triage"]["summary"].startswith("Unguarded falcoctl")
+    assert cells[RED_CELL]["triage"]["citations"][0]["ref"] == "falco.txt:2"
+    group = next(g for g in s["per_version"]["0.45.0"]["groups"] if g["id"] == "falcoctl-no-driver")
+    # two cells, one sentence: one line on the card
+    assert [(t["summary"][:10], len(t["cells"])) for t in group["triage"]] == [("Unguarded ", 2)]
+
+
+@pytest.mark.parametrize("over", [
+    {"grounded": False},
+    {"outcome": "provider_error", "summary": None},
+    {"evidence_sha256": "f" * 64},          # explains evidence this cell no longer has
+    {"schema": "something-else/1"},
+])
+def test_triage_not_shown_unless_grounded_and_current(grid, tmp_path, over):
+    troot = tmp_path / "tri"
+    write_triage(troot, *RED_CELL, grid, **over)
+    s, cells = triaged(grid, troot)
+    assert cells[RED_CELL]["triage"] is None
+    group = next(g for g in s["per_version"]["0.45.0"]["groups"] if g["id"] == "falcoctl-no-driver")
+    assert "triage" not in group
+
+
+def test_triage_never_changes_the_verdict(grid, tmp_path):
+    troot = tmp_path / "tri"
+    without, _ = triaged(grid, troot)
+    for cell in ("ubuntu-20.04--5.4--fresh-auto", "ubuntu-20.04--5.4--fresh-kmod",
+                 "ubuntu-22.04--5.15--fresh-kmod"):
+        write_triage(troot, "0.45.0", cell, grid)
+    with_t, cells = triaged(grid, troot)
+    assert all(cells[("0.45.0", c)]["triage"] for c in ("ubuntu-20.04--5.4--fresh-auto",))
+    for v in ("0.45.0-rc4", "0.45.0"):
+        a, b = without["per_version"][v], with_t["per_version"][v]
+        assert (a["gate"], a["counts"], a["checks"]) == (b["gate"], b["counts"], b["checks"])
+    assert [c["status"] for c in without["cells"]] == [c["status"] for c in with_t["cells"]]
+
+
+def test_blocked_cell_shows_triage_in_its_drawer_only(grid, tmp_path):
+    troot = tmp_path / "tri"
+    blocked = ("0.45.0", "centos-7--3.10--upgrade")
+    write_triage(troot, *blocked, grid, cell_status="blocked")
+    s, cells = triaged(grid, troot)
+    assert cells[blocked]["triage"] and cells[blocked]["signature"] is None
+    assert all("triage" not in g for g in s["per_version"]["0.45.0"]["groups"])
+
+
+def test_triage_read_from_the_results_roots_sibling(tmp_path):
+    # The Jenkins job writes results/triage beside results/qualification;
+    # the dashboard finds it with no flag.
+    results = tmp_path / "results" / "qualification"
+    rec = record("0.45.0", "ubuntu-20.04--5.4--fresh-auto", "fail", "pkg_installed: exit 100", HALF)
+    write_cell(results, rec, {"falco.txt": FALCO_TXT, "install.log": NO_DRIVER})
+    write_triage(tmp_path / "results" / "triage", *RED_CELL, results)
+    s = server.build_state(results, qual_path=tmp_path / "x.yaml", matrix_path=tmp_path / "x.yaml")
+    assert s["cells"][0]["triage"]["root_cause_code"] == "PACKAGE_SCRIPT_FAILED"
+
+
+def test_fingerprint_changes_when_triage_lands(grid, tmp_path):
+    troot = tmp_path / "tri"
+    before = server.fingerprint(grid, [troot])
+    write_triage(troot, *RED_CELL, grid)
+    assert server.fingerprint(grid, [troot]) != before
+
+
+def test_page_labels_triage_advisory():
+    page = server.PAGE.read_text()
+    assert "Model triage · advisory" in page and "not part of the gate" in page
+
+
 def test_export_embeds_state_and_cannot_close_its_script_tag(grid):
     state = build(grid)
     state["cells"][0]["reason"] = "</script><script>alert(1)</script>"

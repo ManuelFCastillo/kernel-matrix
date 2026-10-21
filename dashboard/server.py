@@ -35,6 +35,11 @@ What the page shows, and where each number comes from:
                 own evidence, with the file and line that matched. Cells with
                 the same signature are one failure, not many
     evidence    the manifest qualify.py wrote (sha256 per file), served as is
+    triage      advisory: a model's one-sentence cause for a red cell, read
+                from kestrel-triage/1 files (<triage root>/<version>/<cell>.json).
+                Shown only when every citation is a real line of the bundle
+                and the file names this cell's current evidence. Never part
+                of the gate, the colours or the counts
 """
 
 from __future__ import annotations
@@ -63,6 +68,7 @@ import qualify  # noqa: E402
 PAGE = HERE / "kestrel.html"
 RESULTS = REPO / "results" / "qualification"
 RUNNING_STALE_S = 45 * 60      # a log older than any cell can take is a dead run
+TRIAGE_SCHEMA = "kestrel-triage/1"
 
 # ---------------------------------------------------------------------------
 # Failure signatures: what a red cell's own evidence says went wrong
@@ -157,6 +163,44 @@ def key_lines(evidence_dir: Path, sig: dict | None, limit: int = 8) -> list[dict
 
 
 # ---------------------------------------------------------------------------
+# Triage: a model's explanation, written beside the results, never judged by them
+# ---------------------------------------------------------------------------
+def evidence_sha256(manifest: dict) -> str:
+    """The bundle's identity, computed exactly as the triage writer does:
+    sha256 over "name:sha256\\n" for each manifest file, sorted by name."""
+    files = manifest.get("files") or {}
+    text = "".join(f"{name}:{files[name].get('sha256', '')}\n" for name in sorted(files))
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+def triage_roots(results: list[Path], extra: list[Path] | None = None) -> list[Path]:
+    """--triage roots first, then each results root's sibling triage/ (where
+    the Jenkins job writes it: results/qualification -> results/triage)."""
+    return list(dict.fromkeys(list(extra or []) + [r.parent / "triage" for r in results]))
+
+
+def find_triage(roots: list[Path], version: str, cell: str, manifest: dict) -> dict | None:
+    """The grounded diagnosis of this cell's current evidence, or None. A file
+    for older evidence, an ungrounded one or a failed call is not shown."""
+    if not manifest:
+        return None
+    digest = evidence_sha256(manifest)
+    for root in roots:
+        path = root / version / f"{cell}.json"
+        try:
+            t = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if (t.get("schema") == TRIAGE_SCHEMA and t.get("evidence_sha256") == digest
+                and t.get("outcome") == "diagnosed" and t.get("grounded") is True and t.get("summary")):
+            return {"summary": t["summary"], "root_cause_code": t.get("root_cause_code"),
+                    "diagnosis": t.get("diagnosis"), "confidence": t.get("confidence"),
+                    "citations": (t.get("citations") or [])[:3], "model": t.get("model"),
+                    "generated_at": t.get("generated_at")}
+    return None
+
+
+# ---------------------------------------------------------------------------
 # State: everything the page needs, rebuilt from disk
 # ---------------------------------------------------------------------------
 def load_records(root: Path) -> list[dict]:
@@ -186,8 +230,8 @@ def owners(roots: list[Path]) -> dict[str, Path]:
     return out
 
 
-def fingerprint(root: Path | list[Path]) -> str:
-    """Changes whenever a result, log or evidence file lands or grows."""
+def fingerprint(root: Path | list[Path], triage: list[Path] = ()) -> str:
+    """Changes whenever a result, log, evidence or triage file lands or grows."""
     h = hashlib.sha1()
     for r in as_roots(root):
         for path in sorted(r.glob("*/*.json")) + sorted(r.glob("*/logs/*.log")):
@@ -196,6 +240,13 @@ def fingerprint(root: Path | list[Path]) -> str:
             except OSError:
                 continue
             h.update(f"{r}:{path.relative_to(r)}:{st.st_mtime_ns}:{st.st_size}".encode())
+    for t in triage:
+        for path in sorted(t.glob("*/*.json")):
+            try:
+                st = path.stat()
+            except OSError:
+                continue
+            h.update(f"{t}:{path.relative_to(t)}:{st.st_mtime_ns}:{st.st_size}".encode())
     return h.hexdigest()[:16]
 
 
@@ -230,7 +281,7 @@ def running_cells(root: Path, now: float) -> list[dict]:
     return out
 
 
-def compact(record: dict, root: Path) -> dict:
+def compact(record: dict, root: Path, triage: list[Path] = ()) -> dict:
     """One cell as the page needs it: verdict, checks, package, evidence."""
     vdir = root / record["version"]
     edir = vdir / Path(record["evidence"]).parent
@@ -261,6 +312,9 @@ def compact(record: dict, root: Path) -> dict:
         "build": record.get("build"),
         "signature": sig,
         "key_lines": key_lines(edir, sig) if red else [],
+        # blocked is not red to the gate, but the triage writer explains it too
+        "triage": (find_triage(triage, record["version"], record["cell"], manifest)
+                   if red or record["status"] == "blocked" else None),
         "evidence": [{"name": n, "bytes": f["bytes"], "lines": f["lines"], "sha256": f["sha256"]}
                      for n, f in sorted((manifest.get("files") or {}).items())],
         "collected_at": manifest.get("collected_at"),
@@ -281,6 +335,16 @@ def failure_groups(cells: list[dict], gate: dict) -> list[dict]:
         g = groups.setdefault(sig["id"], {**sig, "cells": [], "new_count": 0, "known_count": 0,
                                           "known_since": None})
         g["cells"].append(c["cell"])
+        t = c.get("triage")
+        if t:
+            # One line per distinct sentence, so twelve cells that a model
+            # explains the same way read as one explanation.
+            seen = next((x for x in g.setdefault("triage", []) if x["summary"] == t["summary"]), None)
+            if seen:
+                seen["cells"].append(c["cell"])
+            else:
+                g["triage"].append({"summary": t["summary"], "root_cause_code": t["root_cause_code"],
+                                    "model": t["model"], "cells": [c["cell"]]})
         state = status_of.get(key, "new")
         g[f"{state}_count"] += 1
         if state == "known":
@@ -311,15 +375,17 @@ def expected_cells(qual_path: Path, matrix_path: Path) -> list[str]:
 
 
 def build_state(root: Path | list[Path] = RESULTS, qual_path: Path = REPO / "qualification.yaml",
-                matrix_path: Path = REPO / "matrix.yaml", now: float | None = None) -> dict:
+                matrix_path: Path = REPO / "matrix.yaml", now: float | None = None,
+                triage: list[Path] | None = None) -> dict:
     now = now or time.time()
     roots = as_roots(root)
+    troots = triage_roots(roots, triage)
     owner = owners(roots)
     records, cells, running = [], [], []
     for r_root in roots:
         mine = [r for r in load_records(r_root) if owner.get(r["version"]) == r_root]
         records += mine
-        cells += [compact(r, r_root) for r in mine]
+        cells += [compact(r, r_root, troots) for r in mine]
         running += [r for r in running_cells(r_root, now) if owner.get(r["version"]) == r_root]
     flat = [{"version": r["version"], "distro": r["distro"], "kernel": r["kernel"],
              "scenario": r["scenario"]["id"], "status": r["status"], "reason": r["reason"],
@@ -360,7 +426,7 @@ def build_state(root: Path | list[Path] = RESULTS, qual_path: Path = REPO / "qua
     return {
         "schema_version": 1,
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
-        "fingerprint": fingerprint(roots),
+        "fingerprint": fingerprint(roots, troots),
         "versions": versions,
         "targets": [{"distro": d, "kernel": k} for d, k in targets],
         "scenarios": scenario_order,
@@ -456,6 +522,7 @@ def resolve_evidence(root: Path | list[Path], version: str, cell: str, name: str
 
 class Handler(BaseHTTPRequestHandler):
     root: list[Path] = [RESULTS]
+    triage: list[Path] = []          # --triage roots; results siblings are added in build_state
     server_version = "KestrelQA/1"
 
     def log_message(self, fmt, *args):  # quieter than the default per-request line
@@ -479,18 +546,18 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(200, wrap(page_fragment()).encode(), "text/html; charset=utf-8")
         if parts == ["api", "state"]:
             since = parse_qs(url.query).get("since", [""])[0]
-            fp = fingerprint(self.root)
+            fp = fingerprint(self.root, triage_roots(self.root, self.triage))
             if since and since == fp and not any(running_cells(r, time.time()) for r in self.root):
                 return self.send(200, b'{"unchanged":true}', "application/json")
-            body = json.dumps({**build_state(self.root), "mode": "live"}).encode()
+            body = json.dumps({**build_state(self.root, triage=self.triage), "mode": "live"}).encode()
             return self.send(200, body, "application/json")
         stamp = time.strftime("%Y%m%d-%H%M")
         if parts == ["export.json"]:
-            body = json.dumps({**build_state(self.root), "mode": "snapshot"}, indent=2).encode()
+            body = json.dumps({**build_state(self.root, triage=self.triage), "mode": "snapshot"}, indent=2).encode()
             return self.send(200, body, "application/json",
                              {"Content-Disposition": f'attachment; filename="kestrel-{stamp}.json"'})
         if parts == ["export.pdf"]:
-            state = build_state(self.root)
+            state = build_state(self.root, triage=self.triage)
             version = parse_qs(url.query).get("version", [""])[0] or (state["versions"] or [""])[-1]
             if version not in state["versions"]:
                 return self.send(HTTPStatus.NOT_FOUND, b"no such release\n", "text/plain")
@@ -505,7 +572,7 @@ class Handler(BaseHTTPRequestHandler):
             # A download is opened from disk, where nothing adds the document
             # skeleton the artifact host would: without <meta charset> the
             # browser reads the UTF-8 as Latin-1 and renders in quirks mode.
-            body = wrap(export_fragment(build_state(self.root))).encode()
+            body = wrap(export_fragment(build_state(self.root, triage=self.triage))).encode()
             return self.send(200, body, "text/html; charset=utf-8",
                              {"Content-Disposition": f'attachment; filename="kestrel-{stamp}.html"'})
         if len(parts) == 4 and parts[0] == "evidence":
@@ -522,18 +589,23 @@ def main() -> int:
     ap.add_argument("--port", type=int, default=8099)
     ap.add_argument("--results", type=Path, action="append",
                     help=f"result root, repeatable; first wins per version (default {RESULTS})")
+    ap.add_argument("--triage", type=Path, action="append", default=[],
+                    help="kestrel-triage/1 root, repeatable (each results root's sibling "
+                         "triage/ is always read too)")
     ap.add_argument("--export", type=Path, metavar="FILE",
                     help="write a self-contained snapshot page and exit")
     args = ap.parse_args()
     args.results = args.results or [RESULTS]
     if args.export:
-        args.export.write_text(export_fragment(build_state(args.results)))
+        args.export.write_text(export_fragment(build_state(args.results, triage=args.triage)))
         print(f"wrote {args.export}")
         return 0
     Handler.root = args.results
+    Handler.triage = args.triage
     srv = ThreadingHTTPServer((args.host, args.port), Handler)
     print(f"Kestrel QA on http://{args.host}:{args.port} reading "
-          f"{', '.join(map(str, args.results))}", flush=True)
+          f"{', '.join(map(str, args.results))}; triage from "
+          f"{', '.join(map(str, triage_roots(args.results, args.triage)))}", flush=True)
     srv.serve_forever()
     return 0
 

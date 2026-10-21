@@ -23,6 +23,9 @@
 //                  and container detection, outputs, load, soak, lifecycle
 //     Gate         qualify.py --gate <rc>: red only for cells that are red
 //                  now and were not red in an earlier version
+//     Triage       advisory only: a model's one cited sentence per red
+//                  cell, into results/triage/ for the dashboard. Never
+//                  changes the build result
 //
 //  The gate is what keeps this useful. 13 cells of 0.45.1-rc1 are red
 //  (#3994 on 18.04/20.04, centos-7's glibc, the falcoctl kmod headers bug).
@@ -42,6 +45,8 @@
 // The versions this build qualifies, decided in Discover. Every stage,
 // when{} and post block closes over this one list.
 def toQualify = []
+// The gate's exit code once it has run; Triage runs only after a verdict.
+def gateRc = null
 
 pipeline {
     agent any
@@ -83,6 +88,8 @@ pipeline {
         KMATRIX_ROOT        = "${env.HOME}/kernel-matrix-lab"
         LIBVIRT_DEFAULT_URI = 'qemu:///system'
         KM_QUAL_SEED        = '/home/mcastill/kernel-matrix/results/qualification'
+        // Advisory triage CLI (writes kestrel-triage/1 JSON). Absent = skipped.
+        KM_TRIAGE           = '/home/mcastill/tools/sensorlab/.venv/bin/sensorlab'
         PYTHONUNBUFFERED    = '1'
     }
 
@@ -175,8 +182,8 @@ pipeline {
         }
 
         stage('Sensor tests') {
-            // After Qualify, before Gate: a red Gate stops the build, and the
-            // sensor results matter most on exactly those nights.
+            // After Qualify, before Gate, so they run whatever the Gate
+            // decides: the sensor results matter most on the nights it is red.
             //
             // The grid asks "does it install and fire one rule"; this asks
             // what a fleet asks after install day, on a VM that lives ~30 min
@@ -211,10 +218,46 @@ pipeline {
                 script {
                     def gates = toQualify.collect { "--gate '${it}'" }.join(' ')
                     def rc = sh(script: "python3 qualify.py ${gates}", returnStatus: true)
-                    if (rc == 1) {
-                        error('new red cells: a cell that was not red in an earlier version is red now (see above)')
-                    } else if (rc != 0) {
-                        error("qualify.py --gate exited ${rc}")
+                    gateRc = rc
+                    // catchError, not a bare error(): the build is red all
+                    // the same, and Triage still runs on the night it is
+                    // needed most.
+                    catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
+                        if (rc == 1) {
+                            error('new red cells: a cell that was not red in an earlier version is red now (see above)')
+                        } else if (rc != 0) {
+                            error("qualify.py --gate exited ${rc}")
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Triage') {
+            // Advisory, after the verdict: one cited sentence per red cell
+            // from a model, for the dashboard. Nothing here can change the
+            // build result. qualify.py and its gate never read
+            // results/triage/, a missing tool or an unreachable model is a
+            // yellow stage and a warning, and the build stays whatever the
+            // Gate made it. Each file carries the sha256 of the evidence it
+            // explains, so the dashboard never shows an old sentence beside
+            // re-run evidence, and unchanged evidence is not sent again.
+            when { expression { !toQualify.isEmpty() && gateRc != null } }
+            steps {
+                script {
+                    def versions = toQualify.collect { "--version '${it}'" }.join(' ')
+                    def rc = sh(script: """
+                                    test -x "\$KM_TRIAGE" || { echo "triage tool not installed at \$KM_TRIAGE"; exit 3; }
+                                    timeout 45m "\$KM_TRIAGE" triage --results results/qualification \
+                                        --out results/triage ${versions}
+                                """, returnStatus: true)
+                    def why = [0: null, 1: 'some cells got no usable diagnosis (provider error or malformed reply)',
+                               3: 'triage tool missing or model provider unavailable',
+                               124: 'triage timed out after 45 minutes'][rc]
+                    if (rc != 0) {
+                        catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+                            error("advisory triage exited ${rc}: ${why ?: 'see above'}; the build result is the Gate's")
+                        }
                     }
                 }
             }
@@ -229,6 +272,7 @@ pipeline {
                 // copy the same evidence bundles again and again.
                 def patterns = toQualify.collect { "results/qualification/${it}/**" }
                 patterns += toQualify.collect { "results/sensor/${it}/**" }
+                patterns += toQualify.collect { "results/triage/${it}/*.json" }
                 patterns << 'results/qualification/matrix.json'
                 archiveArtifacts artifacts: patterns.join(', '), allowEmptyArchive: true
             }
