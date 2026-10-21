@@ -81,14 +81,17 @@ TRIAGE_SCHEMA = "kestrel-triage/1"
 # Matched in order against the cell's evidence files; the first pattern that
 # hits names the failure and cites the line. Patterns quote the evidence
 # literally, so a signature is something an engineer can grep for, never an
-# interpretation of it. `known` links a public issue when one exists.
+# interpretation of it. `known` links the upstream issue or PR when one exists,
+# `known_label` says what it is to this failure, `fixed` links the fix.
 SIGNATURES = [
     {"id": "falcoctl-no-driver",
      "pattern": r"no supported driver found for distro",
      "title": "falcoctl: no supported driver found",
      "summary": "The postinst asks falcoctl for a driver before it allows kmod, "
                 "fails under set -e, and leaves the package half-configured.",
-     "known": "https://github.com/falcosecurity/falco/issues/3994"},
+     "known": "https://github.com/falcosecurity/falco/pull/3994",
+     "known_label": "regression from",
+     "fixed": "https://github.com/falcosecurity/falco/pull/4037"},
     {"id": "kmod-downloaded-headers",
      "pattern": r"Kernel configuration is invalid|scripts/Makefile\.debug: No such file",
      "title": "kmod build against falcoctl's downloaded headers failed",
@@ -130,7 +133,8 @@ def find_signature(evidence_dir: Path) -> dict | None:
                 continue
             for n, line in enumerate(path.read_text(errors="replace").splitlines(), 1):
                 if rx.search(line):
-                    return {**{k: sig[k] for k in ("id", "title", "summary", "known")},
+                    return {**{k: sig.get(k) for k in ("id", "title", "summary", "known",
+                                                       "known_label", "fixed")},
                             "file": name, "line": n, "text": clean(line)[:240]}
     return None
 
@@ -142,7 +146,8 @@ def fallback_signature(record: dict) -> dict:
     norm = re.sub(r"\d+", "N", reason.split(":", 1)[0] + ":" + reason.split(":", 1)[-1])[:80]
     return {"id": "unmatched-" + hashlib.sha1(norm.encode()).hexdigest()[:8],
             "title": reason[:90], "summary": "No known failure pattern matched this cell's evidence.",
-            "known": None, "file": None, "line": None, "text": None}
+            "known": None, "known_label": None, "fixed": None,
+            "file": None, "line": None, "text": None}
 
 
 def key_lines(evidence_dir: Path, sig: dict | None, limit: int = 8) -> list[dict]:

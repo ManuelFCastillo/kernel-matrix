@@ -88,7 +88,7 @@ def test_signature_text_has_ansi_stripped(tmp_path):
     (tmp_path / "falco.txt").write_text(FALCO_TXT)
     found = server.find_signature(tmp_path)
     assert "\x1b" not in found["text"] and found["text"].startswith("2026-10-17 ERROR no supported driver")
-    assert found["known"].endswith("/issues/3994")
+    assert found["known"].endswith("/pull/3994")
 
 
 def test_signature_order_decides_between_two_matches(tmp_path):
@@ -211,7 +211,7 @@ def test_one_signature_is_one_failure_however_many_cells(grid):
     # fresh-auto was red in rc4 (known); fresh-kmod has no earlier result (new)
     assert (by_id["falcoctl-no-driver"]["new_count"], by_id["falcoctl-no-driver"]["known_count"]) == (1, 1)
     # the counters never clobber the signature's issue link
-    assert by_id["falcoctl-no-driver"]["known"].endswith("/issues/3994")
+    assert by_id["falcoctl-no-driver"]["known"].endswith("/pull/3994")
     assert by_id["kmod-downloaded-headers"]["known"] is None
     assert by_id["falcoctl-no-driver"]["known_since"] == "0.45.0-rc4"
     # new cells first, then size: both groups have one new cell, #3994 has more
@@ -639,3 +639,19 @@ def test_page_shows_the_sensor_suite_as_informational():
     # The verdict tile reads the gate only.
     tiles = page[page.index("function renderTiles()"):page.index("function cellAt(")]
     assert "sensor" not in tiles
+
+
+def test_falcoctl_signature_names_the_regression_and_its_fix():
+    sig = next(s for s in server.SIGNATURES if s["id"] == "falcoctl-no-driver")
+    assert sig["known"].endswith("/pull/3994") and sig["known_label"] == "regression from"
+    assert sig["fixed"].endswith("/pull/4037")
+
+
+def test_red_cell_hover_has_signature_gate_and_grounded_triage_lines():
+    page = server.page_fragment()
+    # one place builds the hover; the grid uses it
+    assert "function cellTip(c, gs)" in page and "cellTip(x.c, gs)" in page
+    # line 1 deterministic (signature + new/known), line 2 only from a triage
+    # the server already matched to this evidence
+    assert "NEW in this release" in page and "known since" in page
+    assert "c.triage?.summary" in page

@@ -350,6 +350,31 @@ table.grid { border-collapse: separate; border-spacing: 6px; width: 100%; min-wi
     for (const k of ["new", "known", "fixed"]) { const r = g[k].find((x) => x.cell === name); if (r) return { kind: k, ...r }; }
     return null;
   }
+  // "regression from falcosecurity/falco#3994, fixed upstream in #4037"
+  function upstream(s) {
+    if (!s?.known) return "";
+    const ref = (u) => `<a href="${esc(u)}" target="_blank" rel="noopener">${esc(u.replace("https://github.com/", "").replace(/\/(issues|pull)\//, "#"))}</a>`;
+    return ` ${s.known_label ? esc(s.known_label) + " " : ""}${ref(s.known)}${s.fixed ? `, fixed upstream in ${ref(s.fixed)}` : ""}`;
+  }
+  // The hover on a red cell: what failed, then up to two more lines.
+  //   1. the failure signature and whether the gate calls it new or known
+  //      (deterministic: the regex and the gate own this line)
+  //   2. the model's one-sentence cause, only when the server found a
+  //      grounded triage file for this exact evidence; advisory, never a verdict
+  function cellTip(c, gs) {
+    const lines = [`${STATUS[c.status]}${c.reason ? ": " + c.reason : ""}`];
+    if (!["fail", "error", "blocked"].includes(c.status)) return lines.join("\n");
+    const sig = c.signature && !c.signature.id.startsWith("unmatched-") ? c.signature : null;
+    const when = gs?.kind === "new" ? "NEW in this release"
+      : gs?.kind === "known" ? `known since ${(sig && firstSeen(sig.id)) || gs.baseline_version}` : "";
+    const head = [sig?.title, when].filter(Boolean).join(" · ");
+    if (head) lines.push(head);
+    if (c.triage?.summary) {
+      const who = /^beam/i.test(c.triage.model || "") ? "Beam" : (c.triage.model || "Model");
+      lines.push(`${who}: ${c.triage.summary}`);
+    }
+    return lines.join("\n");
+  }
   function firstSeen(sigId) {
     const vs = state.cells.filter((c) => c.signature?.id === sigId).map((c) => c.version);
     return state.versions.find((v) => vs.includes(v));
@@ -463,7 +488,7 @@ table.grid { border-collapse: separate; border-spacing: 6px; width: 100%; min-wi
         const gs = x.c ? gateState(version, x.name) : null;
         const tag = gs?.kind === "new" ? `<span class="new">NEW</span>` : gs?.kind === "fixed" ? `<span class="new fixed">FIXED</span>` : "";
         const drv = x.c && x.c.status === "pass" ? DRIVER[x.c.driver] || "" : x.status === "running" ? x.r.phase : "";
-        const tip = x.c ? `${STATUS[x.status]}${x.c.reason ? ": " + x.c.reason : ""}` : x.r ? `Running: ${x.r.phase}` : STATUS[x.status];
+        const tip = x.c ? cellTip(x.c, gs) : x.r ? `Running: ${x.r.phase}` : STATUS[x.status];
         const click = x.c ? ` data-cell="${esc(x.name)}" tabindex="0" role="button"` : "";
         return `<td><div class="cell s-${x.status}${openCell === x.name ? " sel" : ""}"${click} title="${esc(tip)}" aria-label="${esc(distroName(t.distro) + " " + kernelName(t.kernel) + ", " + s + ": " + tip)}">${tag}<span class="g">${GLYPH[x.status]}</span>${drv ? `<span class="d">${esc(drv)}</span>` : ""}</div></td>`;
       }).join("")}</tr>`;
@@ -508,7 +533,7 @@ table.grid { border-collapse: separate; border-spacing: 6px; width: 100%; min-wi
       const badge = g.new_count ? `<span class="chip red">${g.new_count} new</span>` : `<span class="chip amber">known since ${esc(seen || g.known_since || "earlier")}</span>`;
       const cells = g.cells.map((n) => { const [d, k, s] = n.split("--"); return `<button class="chip link" data-cell="${esc(n)}">${esc(distroName(d))} ${esc(kernelName(k))} · ${esc(s)}</button>`; }).join("");
       const cite = g.file ? `<div class="cite"><b>${esc(g.file)}:${g.line}</b>  ${esc(g.text)}</div>` : "";
-      const known = g.known ? ` <a href="${esc(g.known)}" target="_blank" rel="noopener">${esc(g.known.replace("https://github.com/", "").replace("/issues/", "#"))}</a>` : "";
+      const known = upstream(g);
       // A model words one cause several ways: the card shows the most common
       // wording, the drawer shows each cell's own.
       const tri = [...(g.triage || [])].sort((a, b) => b.cells.length - a.cells.length);
@@ -545,7 +570,7 @@ table.grid { border-collapse: separate; border-spacing: 6px; width: 100%; min-wi
       : gs.kind === "known" ? `Known: red in ${esc(gs.baseline_version)} too` : `Fixed: ${esc(gs.baseline_status)} in ${esc(gs.baseline_version)}`) : "";
     const checks = c.checks.length ? `<ul class="clist">${c.checks.map((k) => `<li><span style="color:var(${k.passed ? "--pass" : "--fail"})">${k.passed ? "✓" : "✕"}</span><span>${esc(CHECK[k.name] || k.name)}</span><span>${esc(k.observed)}</span></li>`).join("")}</ul>` : `<p class="muted" style="margin:0">Not judged: ${esc(c.reason)}</p>`;
     const sig = c.signature;
-    const sigHtml = sig ? `<section><span class="label">Failure signature</span><div class="sig ${gs?.kind === "known" ? "known" : ""}"><h3>${esc(sig.title)}</h3><p>${esc(sig.summary)}${sig.known ? ` <a href="${esc(sig.known)}" target="_blank" rel="noopener">${esc(sig.known.replace("https://github.com/", "").replace("/issues/", "#"))}</a>` : ""}</p>${c.key_lines.length ? `<div class="cite">${c.key_lines.map((l) => (l.match ? `<b>${esc(l.file)}:${l.line}</b> ` : `${esc(l.file)}:${l.line} `) + esc(l.text)).join("\n")}</div>` : ""}</div></section>` : "";
+    const sigHtml = sig ? `<section><span class="label">Failure signature</span><div class="sig ${gs?.kind === "known" ? "known" : ""}"><h3>${esc(sig.title)}</h3><p>${esc(sig.summary)}${upstream(sig)}</p>${c.key_lines.length ? `<div class="cite">${c.key_lines.map((l) => (l.match ? `<b>${esc(l.file)}:${l.line}</b> ` : `${esc(l.file)}:${l.line} `) + esc(l.text)).join("\n")}</div>` : ""}</div></section>` : "";
     const tr = c.triage;
     const triageHtml = tr ? `<section><span class="label">Model triage · advisory, not part of the gate</span><div class="triage"><p class="tl">${esc(tr.summary)}</p>${tr.diagnosis && tr.diagnosis !== tr.summary ? `<p class="muted" style="margin:0;font-size:12.5px">${esc(tr.diagnosis)}</p>` : ""}${tr.citations.length ? `<div class="cite">${tr.citations.map((l) => `<b>${esc(l.ref)}</b> ${esc(l.text)}`).join("\n")}</div>` : ""}<span class="tm"><span class="chip">${esc(tr.root_cause_code || "")}</span> ${esc(tr.model || "")}${tr.confidence != null ? ` · confidence ${esc(tr.confidence)}` : ""} · ${esc(fmtTime(tr.generated_at))} · every citation checked against this bundle</span></div></section>` : "";
     const link = (f) => LIVE ? `<a href="/evidence/${encodeURIComponent(version)}/${encodeURIComponent(name)}/${encodeURIComponent(f)}" target="_blank" rel="noopener">${esc(f)}</a>` : esc(f);
